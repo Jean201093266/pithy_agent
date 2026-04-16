@@ -1,0 +1,72 @@
+{
+  "name": "pithy-agent-e2e",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Pithy agent desktop + e2e tooling",
+  "author": "pithy-agent",
+  "license": "MIT",
+  "main": "electron/main.js",
+  "scripts": {
+    "desktop:start": "electron .",
+    "clean:dist": "node scripts/clean-dist.mjs",
+    "release:prepare": "node scripts/release-prepare.mjs",
+    "release:artifacts": "node scripts/release-artifacts.mjs",
+    "release:signing:check": "node scripts/release-signing-check.mjs",
+    "release:verify": "node scripts/release-verify.mjs",
+    "release:verify:signed": "node scripts/release-verify.mjs --require-signed",
+    "release:upload:github": "node scripts/release-upload-github.mjs",
+    "release:pipeline": "node scripts/release-pipeline.mjs",
+    "dist:win": "npm run release:prepare && set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win nsis --x64",
+    "dist:win:signed": "npm run release:prepare && npm run release:signing:check && electron-builder --win nsis --x64",
+    "dist:win:dir": "npm run release:prepare && set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win --dir",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.54.2",
+    "electron": "^32.2.0",
+    "electron-builder": "^25.0.5",
+    "yaml": "^2.8.1"
+  },
+  "build": {
+    "appId": "com.pithy.agent",
+    "productName": "PithyLocalAgent",
+    "artifactName": "${productName}-Setup-${version}.${ext}",
+    "files": [
+      "app/**/*",
+      "electron/**/*",
+      "run.py",
+      "requirements.txt",
+      "package.json",
+      "playwright.config.ts",
+      "tests/e2e/**/*"
+    ],
+    "asarUnpack": [
+      "app/**/*",
+      "run.py",
+      "requirements.txt"
+    ],
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
+      "verifyUpdateCodeSignature": false,
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "installerHeader": "build/installerHeader.bmp",
+      "installerSidebar": "build/installerSidebar.bmp",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
+

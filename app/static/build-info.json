@@ -1,0 +1,16 @@
+{
+  "name": "pithy-agent-e2e",
+  "productName": "PithyLocalAgent",
+  "version": "0.1.0",
+  "buildTime": "2026-04-16T04:24:44.675Z",
+  "commit": "unknown",
+  "commits": [],
+  "signing": {
+    "status": "unknown",
+    "isSigned": false,
+    "subject": null,
+    "issuer": null,
+    "thumbprint": null,
+    "notAfter": null
+  }
+}

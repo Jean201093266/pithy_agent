@@ -1,0 +1,143 @@
+:root {
+  --bg: #f5f7fb;
+  --panel: #ffffff;
+  --text: #111827;
+  --muted: #4b5563;
+  --border: #d1d5db;
+  --header: #1f2937;
+  --header-text: #ffffff;
+  --pre-bg: #111827;
+  --pre-text: #e5e7eb;
+}
+
+body[data-theme="dark"] {
+  --bg: #0f172a;
+  --panel: #111827;
+  --text: #e5e7eb;
+  --muted: #9ca3af;
+  --border: #374151;
+  --header: #020617;
+  --header-text: #e5e7eb;
+  --pre-bg: #020617;
+  --pre-text: #e5e7eb;
+}
+
+body {
+  font-family: Arial, sans-serif;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+header {
+  background: var(--header);
+  color: var(--header-text);
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+main {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 12px;
+  padding: 12px;
+}
+
+.panel {
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.08);
+}
+
+.stack > div {
+  margin-bottom: 16px;
+}
+
+textarea, input, select {
+  width: 100%;
+  margin: 6px 0;
+  padding: 8px;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+button {
+  background: #2563eb;
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+button.secondary { background: #6b7280; }
+button.danger { background: #dc2626; }
+
+#chat-log {
+  height: 340px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  padding: 8px;
+  border-radius: 6px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.row > * { flex: 1; }
+.inline-row { align-items: center; }
+.header-actions { display: flex; gap: 8px; }
+.small { font-size: 12px; color: var(--muted); }
+
+pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--pre-bg);
+  color: var(--pre-text);
+  padding: 8px;
+  border-radius: 6px;
+  max-height: 200px;
+  overflow: auto;
+}
+
+h3, h4 { margin: 10px 0 4px; }
+#skill-versions { max-height: 140px; }
+#logs-output { max-height: 220px; }
+#ocr-status-output { max-height: 120px; }
+#visual-step-feedback { margin-top: 6px; color: #2563eb; }
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 999;
+}
+
+.lock-card {
+  width: min(420px, 90vw);
+  background: var(--panel);
+  color: var(--text);
+  padding: 20px;
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.2);
+}
+
+.hidden { display: none !important; }
+
+@media (max-width: 960px) {
+  main { grid-template-columns: 1fr; }
+  .row { flex-direction: column; align-items: stretch; }
+}
+
