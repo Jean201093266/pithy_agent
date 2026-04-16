@@ -33,6 +33,11 @@ from app.schemas import (
     AppSettingsOut,
     AuthSessionResponse,
     LogsResponse,
+    MCPServerDeleteResponse,
+    MCPServerIn,
+    MCPServerListResponse,
+    MCPServerOut,
+    MCPServerRegisterResponse,
     ModelConfigIn,
     ModelConfigOut,
     PasswordSetupRequest,
@@ -55,6 +60,7 @@ from app.schemas import (
     UnlockRequest,
 )
 from app.skills.runtime import SkillRuntime
+from app.tools.base import MCPServerConfig
 from app.tools.registry import ToolRegistry
 from app.tools.builtin import check_ocr_availability
 
@@ -352,6 +358,81 @@ def execute_tool(tool_name: str, payload: ToolExecutionRequest, request: Request
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     _audit("tool_execute", f"tool={tool_name}")
     return {"ok": True, "result": result}
+
+
+# ---------------------------------------------------------------------------
+# MCP server management endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/mcp/servers", response_model=MCPServerListResponse)
+def list_mcp_servers(request: Request) -> MCPServerListResponse:
+    _require_unlocked(request)
+    rows = tool_registry.list_mcp_servers()
+    servers = [
+        MCPServerOut(
+            server_id=r["server_id"],
+            transport=r["config"].get("transport", "http"),
+            command=r["config"].get("command", ""),
+            base_url=r["config"].get("base_url", ""),
+            headers=r["config"].get("headers", {}),
+            enabled=r["enabled"],
+            description=r["config"].get("description", ""),
+            connected=r.get("connected", False),
+            tool_count=r.get("tool_count", 0),
+            tools=r.get("tools", []),
+            created_at=r.get("created_at", ""),
+            updated_at=r.get("updated_at", ""),
+        )
+        for r in rows
+    ]
+    return MCPServerListResponse(servers=servers)
+
+
+@app.post("/api/mcp/servers", response_model=MCPServerRegisterResponse)
+def register_mcp_server(payload: MCPServerIn, request: Request) -> MCPServerRegisterResponse:
+    _require_unlocked(request)
+    if payload.transport == "stdio" and not payload.command.strip():
+        raise HTTPException(status_code=400, detail="command is required for stdio transport")
+    if payload.transport == "http" and not payload.base_url.strip():
+        raise HTTPException(status_code=400, detail="base_url is required for http transport")
+    cfg = MCPServerConfig(
+        server_id=payload.server_id,
+        transport=payload.transport,
+        command=payload.command,
+        base_url=payload.base_url,
+        headers=payload.headers,
+        enabled=payload.enabled,
+        description=payload.description,
+    )
+    try:
+        tools = tool_registry.register_mcp_server(cfg)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"failed to register MCP server: {exc}") from exc
+    _audit("mcp_server_registered", f"server_id={payload.server_id} tools={len(tools)}")
+    return MCPServerRegisterResponse(ok=True, server_id=payload.server_id, tools=tools)
+
+
+@app.post("/api/mcp/servers/{server_id}/refresh", response_model=MCPServerRegisterResponse)
+def refresh_mcp_server(server_id: str, request: Request) -> MCPServerRegisterResponse:
+    _require_unlocked(request)
+    try:
+        tools = tool_registry.refresh_mcp_server(server_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="MCP server not found") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"refresh failed: {exc}") from exc
+    _audit("mcp_server_refreshed", f"server_id={server_id}")
+    return MCPServerRegisterResponse(ok=True, server_id=server_id, tools=tools)
+
+
+@app.delete("/api/mcp/servers/{server_id}", response_model=MCPServerDeleteResponse)
+def delete_mcp_server(server_id: str, request: Request) -> MCPServerDeleteResponse:
+    _require_unlocked(request)
+    deleted = tool_registry.unregister_mcp_server(server_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    _audit("mcp_server_deleted", f"server_id={server_id}")
+    return MCPServerDeleteResponse(ok=True, server_id=server_id)
 
 
 @app.post("/api/chat", response_model=ChatResponse)

@@ -156,6 +156,9 @@ def test_custom_tool_import_and_execute() -> None:
         json={'params': {'text': 'hello api custom'}, 'authorized': True},
     )
     assert execute_resp.status_code == 200
-    assert execute_resp.json()['result']['message'] == 'hello api custom'
+    mcp_result = execute_resp.json()['result']
+    # execute returns an MCP envelope: {"content": [{"type": "text", "text": "..."}], "isError": false}
+    assert not mcp_result['isError']
+    assert 'hello api custom' in mcp_result['content'][0]['text']
 
 

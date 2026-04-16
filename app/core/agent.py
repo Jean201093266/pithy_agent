@@ -84,15 +84,24 @@ class ReActDecision:
 # ---------------------------------------------------------------------------
 
 def build_react_system_prompt(tools: list[dict[str, Any]]) -> str:
-    """Build the ReAct system prompt with the list of available tools."""
+    """Build the ReAct system prompt with the list of available tools (MCP inputSchema)."""
     if tools:
+        import json as _json
         lines = []
         for t in tools:
             name = t.get("name", "")
             desc = t.get("description", "")
-            params = t.get("parameters", {})
-            param_str = ", ".join(params.keys()) if isinstance(params, dict) else ""
-            lines.append(f"- {name}({param_str}): {desc}")
+            schema = t.get("inputSchema") or t.get("parameters", {})
+            props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+            required = schema.get("required", []) if isinstance(schema, dict) else []
+            param_parts = []
+            for pname, pdef in props.items():
+                req = "*" if pname in required else ""
+                ptype = pdef.get("type", "string") if isinstance(pdef, dict) else "string"
+                pdesc = pdef.get("description", "") if isinstance(pdef, dict) else ""
+                param_parts.append(f"{pname}{req}:{ptype} {pdesc}".strip())
+            params_str = ", ".join(param_parts) if param_parts else ""
+            lines.append(f"- {name}({params_str}): {desc}")
         tool_descriptions = "\n".join(lines)
     else:
         tool_descriptions = "(no tools available)"

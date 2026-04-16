@@ -61,6 +61,13 @@ class AppDB:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS mcp_servers (
+                    server_id TEXT PRIMARY KEY,
+                    config_json TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
 
@@ -292,5 +299,55 @@ class AppDB:
             "manifest": json.loads(row["manifest_json"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+        }
+
+    # ------------------------------------------------------------------
+    # MCP server persistence
+    # ------------------------------------------------------------------
+
+    def upsert_mcp_server(self, server_id: str, config: dict[str, Any], enabled: bool = True) -> None:
+        serialized = json.dumps(config, ensure_ascii=False)
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO mcp_servers(server_id, config_json, enabled) VALUES(?, ?, ?) "
+                "ON CONFLICT(server_id) DO UPDATE SET config_json = excluded.config_json, "
+                "enabled = excluded.enabled, updated_at = CURRENT_TIMESTAMP",
+                (server_id, serialized, int(enabled)),
+            )
+
+    def delete_mcp_server(self, server_id: str) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute("DELETE FROM mcp_servers WHERE server_id = ?", (server_id,))
+        return cur.rowcount > 0
+
+    def list_mcp_servers(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT server_id, config_json, enabled, created_at, updated_at FROM mcp_servers ORDER BY created_at"
+            ).fetchall()
+        return [
+            {
+                "server_id": row["server_id"],
+                "config": json.loads(row["config_json"]),
+                "enabled": bool(row["enabled"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def get_mcp_server(self, server_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT server_id, config_json, enabled, created_at FROM mcp_servers WHERE server_id = ?",
+                (server_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "server_id": row["server_id"],
+            "config": json.loads(row["config_json"]),
+            "enabled": bool(row["enabled"]),
+            "created_at": row["created_at"],
         }
 

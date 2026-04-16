@@ -27,5 +27,7 @@ def test_import_and_execute_custom_tool_manifest(tmp_path: Path) -> None:
     assert listed['custom_echo']['source'] == 'custom'
 
     result = registry.execute('custom_echo', {'text': 'hello custom'}, authorized=True)
-    assert result['message'] == 'hello custom'
+    # execute() now returns an MCP-style envelope: {"content": [...], "isError": false}
+    assert not result['isError']
+    assert 'hello custom' in result['content'][0]['text']
 

@@ -198,3 +198,40 @@ class SkillRollbackResponse(BaseModel):
     version_id: int
 
 
+# ---------------------------------------------------------------------------
+# MCP server schemas
+# ---------------------------------------------------------------------------
+
+class MCPServerIn(BaseModel):
+    server_id: str = Field(min_length=2, max_length=64, pattern=r"^[a-zA-Z0-9_\-]+$")
+    transport: Literal["stdio", "http"]
+    command: str = Field(default="", description="Shell command for stdio transport")
+    base_url: str = Field(default="", description="HTTP base URL for http transport")
+    headers: dict[str, str] = Field(default_factory=dict)
+    enabled: bool = True
+    description: str = ""
+
+
+class MCPServerOut(MCPServerIn):
+    connected: bool = False
+    tool_count: int = 0
+    tools: list[str] = Field(default_factory=list)
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class MCPServerListResponse(BaseModel):
+    servers: list[MCPServerOut]
+
+
+class MCPServerRegisterResponse(BaseModel):
+    ok: bool
+    server_id: str
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class MCPServerDeleteResponse(BaseModel):
+    ok: bool
+    server_id: str
+
+
