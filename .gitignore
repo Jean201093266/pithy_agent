@@ -9,4 +9,6 @@ data/*.key
 node_modules/
 playwright-report/
 test-results/
+build
+dist
 
