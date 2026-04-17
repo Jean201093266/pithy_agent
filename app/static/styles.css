@@ -785,3 +785,173 @@ pre {
   .msg-row { padding: 4px 12px; }
 }
 
+/* ── Suggestion chips ────────────────────────────────────────────────── */
+.suggestion-chips {
+  display: flex; flex-wrap: wrap; gap: 8px; justify-content: center;
+  margin-top: 6px;
+}
+
+.chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 7px 14px;
+  font-size: 12.5px; font-weight: 500;
+  background: var(--surface);
+  border: 1.5px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--text-2);
+  transition: border-color .15s, background .15s, color .15s, transform .1s;
+  user-select: none;
+}
+.chip:hover {
+  border-color: var(--accent-b);
+  background: var(--accent-t);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+
+/* ── Message timestamps ───────────────────────────────────────────────── */
+.msg-row { position: relative; }
+
+.msg-time {
+  position: absolute;
+  bottom: -16px;
+  font-size: 10px;
+  color: var(--text-4);
+  opacity: 0;
+  transition: opacity .15s;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.msg-row.user .msg-time { right: 0; }
+.msg-row.assistant .msg-time { left: 40px; }
+.msg-row:hover .msg-time { opacity: 1; }
+
+/* ── Code block copy button ───────────────────────────────────────────── */
+.code-block-wrap {
+  position: relative;
+}
+.code-block-wrap:hover .copy-code-btn { opacity: 1; }
+
+.code-lang-label {
+  position: absolute; top: 8px; left: 14px;
+  font-family: var(--font-mono);
+  font-size: 10px; font-weight: 600;
+  color: rgba(255,255,255,.35);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  pointer-events: none;
+  user-select: none;
+}
+
+.copy-code-btn {
+  position: absolute; top: 8px; right: 8px;
+  opacity: 0;
+  background: rgba(255,255,255,.1);
+  border: 1px solid rgba(255,255,255,.15);
+  border-radius: var(--r-xs);
+  color: rgba(255,255,255,.7);
+  padding: 3px 7px;
+  font-size: 11px; font-weight: 600;
+  cursor: pointer;
+  transition: opacity .15s, background .15s;
+  line-height: 1.4;
+}
+.copy-code-btn:hover { background: rgba(255,255,255,.18); color: #fff; }
+.copy-code-btn.copied { color: #4ade80; border-color: rgba(74,222,128,.3); }
+
+/* ── Thinking indicator row ───────────────────────────────────────────── */
+#thinking-row { margin-bottom: 4px; }
+
+/* ── Send button loading state ────────────────────────────────────────── */
+.btn-loading {
+  position: relative;
+  pointer-events: none;
+  color: transparent !important;
+}
+.btn-loading::after {
+  content: '';
+  position: absolute; inset: 0; margin: auto;
+  width: 14px; height: 14px;
+  border: 2px solid rgba(255,255,255,.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin .6s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Form cards ───────────────────────────────────────────────────────── */
+.form-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 14px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+
+/* ── Character counter ────────────────────────────────────────────────── */
+.char-counter {
+  font-size: 11px; color: var(--text-4);
+  transition: color .15s;
+  user-select: none;
+}
+.char-counter.near-limit { color: var(--warn); }
+.char-counter.at-limit   { color: var(--danger); }
+
+/* ── Sidebar session time ─────────────────────────────────────────────── */
+.session-time {
+  font-size: 10.5px; color: var(--text-4);
+  white-space: nowrap; flex-shrink: 0;
+  transition: color .1s;
+}
+.session-item:hover .session-time { color: var(--text-3); }
+
+/* ── Scrollbar reveal on hover ────────────────────────────────────────── */
+#session-list { scrollbar-width: none; }
+#session-list::-webkit-scrollbar { width: 0; }
+#session-sidebar:hover #session-list { scrollbar-width: thin; }
+#session-sidebar:hover #session-list::-webkit-scrollbar { width: 4px; }
+
+/* ── Message fade-in animation ────────────────────────────────────────── */
+.msg-row {
+  animation: msgIn .2s ease;
+}
+@keyframes msgIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Panel section header ─────────────────────────────────────────────── */
+.panel-section-title {
+  font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-3);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── Kbd shortcut badge ───────────────────────────────────────────────── */
+kbd {
+  display: inline-flex; align-items: center;
+  padding: 1px 5px;
+  font-family: var(--font-mono); font-size: 10.5px;
+  background: var(--surface-3);
+  border: 1px solid var(--border-2);
+  border-bottom-width: 2px;
+  border-radius: var(--r-xs);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+/* ── Compose hint line ────────────────────────────────────────────────── */
+.compose-hint {
+  font-size: 11px; color: var(--text-4);
+  display: flex; align-items: center; gap: 4px;
+  padding: 0 0 0 2px;
+}
+
+/* ── Step indicator pill ──────────────────────────────────────────────── */
+#step-indicator {
+  animation: msgIn .18s ease;
+}
+

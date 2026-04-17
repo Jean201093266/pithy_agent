@@ -116,10 +116,80 @@ function applyTranslations() {
 function renderMarkdown(text) {
   if (typeof marked !== 'undefined') {
     try {
+      // Configure highlight.js renderer once
+      if (typeof hljs !== 'undefined' && !renderMarkdown._configured) {
+        marked.setOptions({
+          highlight: (code, lang) => {
+            if (lang && hljs.getLanguage(lang)) {
+              return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
+            }
+            return hljs.highlightAuto(code).value;
+          },
+          langPrefix: 'hljs language-',
+        });
+        renderMarkdown._configured = true;
+      }
       return marked.parse(text, { breaks: true, gfm: true });
     } catch (e) { /* fall through */ }
   }
   return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g ,'<br>');
+}
+
+/** Wrap pre>code blocks with copy button after inserting html */
+function enhanceCodeBlocks(el) {
+  el.querySelectorAll('pre').forEach(pre => {
+    if (pre.parentElement && pre.parentElement.classList.contains('code-block-wrap')) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'code-block-wrap';
+    pre.parentNode.insertBefore(wrap, pre);
+    wrap.appendChild(pre);
+
+    // Language label
+    const codeEl = pre.querySelector('code');
+    if (codeEl) {
+      const langMatch = codeEl.className.match(/language-(\S+)/);
+      if (langMatch) {
+        const langLabel = document.createElement('span');
+        langLabel.className = 'code-lang-label';
+        langLabel.textContent = langMatch[1];
+        wrap.appendChild(langLabel);
+      }
+    }
+
+    const btn = document.createElement('button');
+    btn.className = 'copy-code-btn';
+    btn.textContent = '复制';
+    btn.onclick = () => {
+      const code = pre.querySelector('code') ? pre.querySelector('code').innerText : pre.innerText;
+      navigator.clipboard && navigator.clipboard.writeText(code).then(() => {
+        btn.textContent = '已复制 ✓';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = '复制'; btn.classList.remove('copied'); }, 2000);
+      });
+    };
+    wrap.appendChild(btn);
+  });
+}
+
+/** Format a Date as HH:MM */
+function formatTime(d) {
+  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+}
+
+/** Format relative time for session list */
+function relativeTime(dateStr) {
+  if (!dateStr) return '';
+  try {
+    const d = new Date(dateStr.replace(' ', 'T'));
+    const diff = Date.now() - d.getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return '刚刚';
+    if (mins < 60) return `${mins}分钟前`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}小时前`;
+    const days = Math.floor(hrs / 24);
+    return `${days}天前`;
+  } catch { return ''; }
 }
 
 function appendLine(role, text) {
@@ -130,6 +200,11 @@ function appendLine(role, text) {
   const row = document.createElement('div');
   row.className = `msg-row ${role}`;
 
+  // Timestamp
+  const timeEl = document.createElement('span');
+  timeEl.className = 'msg-time';
+  timeEl.textContent = formatTime(new Date());
+
   if (role === 'assistant') {
     const wrap = document.createElement('div');
     wrap.className = 'msg-content-wrap';
@@ -139,6 +214,7 @@ function appendLine(role, text) {
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble';
     bubble.innerHTML = renderMarkdown(text);
+    enhanceCodeBlocks(bubble);
     wrap.appendChild(avatar);
     wrap.appendChild(bubble);
     row.appendChild(wrap);
@@ -148,15 +224,48 @@ function appendLine(role, text) {
     bubble.textContent = text;
     row.appendChild(bubble);
   } else {
-    // error
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble';
     bubble.textContent = text;
     row.appendChild(bubble);
   }
 
+  row.appendChild(timeEl);
   chatLog.appendChild(row);
   chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+/** Show animated thinking indicator in chat */
+function showThinking() {
+  const row = document.createElement('div');
+  row.className = 'msg-row assistant';
+  row.id = 'thinking-row';
+  const wrap = document.createElement('div');
+  wrap.className = 'msg-content-wrap';
+  const avatar = document.createElement('div');
+  avatar.className = 'msg-avatar';
+  avatar.textContent = 'AI';
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  bubble.innerHTML = '<div class="msg-thinking"><span></span><span></span><span></span></div>';
+  wrap.appendChild(avatar);
+  wrap.appendChild(bubble);
+  row.appendChild(wrap);
+  const empty = chatLog.querySelector('.chat-empty');
+  if (empty) empty.remove();
+  chatLog.appendChild(row);
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function hideThinking() {
+  const row = document.getElementById('thinking-row');
+  if (row) row.remove();
+}
+
+/** Auto-resize textarea */
+function autoResizeTextarea(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 220) + 'px';
 }
 
 // ── Toast notifications ──────────────────────────────────────────────────
@@ -325,6 +434,12 @@ function renderSessionList() {
     infoDiv.appendChild(nameSpan);
     infoDiv.appendChild(metaSpan);
     li.appendChild(infoDiv);
+
+    // Relative time badge
+    const timeEl = document.createElement('span');
+    timeEl.className = 'session-time';
+    timeEl.textContent = relativeTime(s.updated_at || s.created_at);
+    li.appendChild(timeEl);
 
     // Action buttons group
     const actions = document.createElement('div');
@@ -725,40 +840,155 @@ async function loadProtectedData() {
 }
 
 document.getElementById('send-btn').onclick = async () => {
-  const msg = document.getElementById('chat-input').value.trim();
+  const input = document.getElementById('chat-input');
+  const msg = input.value.trim();
   if (!msg) return;
   appendLine('user', msg);
-  document.getElementById('chat-input').value = '';
+  input.value = '';
+  autoResizeTextarea(input);
+  updateCharCounter(input);
+
+  const sendBtn = document.getElementById('send-btn');
+  sendBtn.classList.add('btn-loading');
+  sendBtn.disabled = true;
+  input.disabled = true;
+
+  // Remove old empty state
+  const empty = chatLog.querySelector('.chat-empty');
+  if (empty) empty.remove();
+
+  // Create step indicator row
+  const stepRow = document.createElement('div');
+  stepRow.id = 'step-indicator';
+  stepRow.style.cssText = 'padding:4px 20px 2px;';
+  const stepPill = document.createElement('div');
+  stepPill.style.cssText = 'display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--text-3);padding:5px 12px;background:var(--surface-3);border:1px solid var(--border);border-radius:999px;max-width:90%;';
+  stepPill.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;animation:spin .8s linear infinite"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg><span id="step-text">准备中…</span>';
+  stepRow.appendChild(stepPill);
+  chatLog.appendChild(stepRow);
+  chatLog.scrollTop = chatLog.scrollHeight;
+
+  // AI bubble (streaming into it)
+  const aiRow = document.createElement('div');
+  aiRow.className = 'msg-row assistant';
+  const aiWrap = document.createElement('div');
+  aiWrap.className = 'msg-content-wrap';
+  const aiAvatar = document.createElement('div');
+  aiAvatar.className = 'msg-avatar';
+  aiAvatar.textContent = 'AI';
+  const aiBubble = document.createElement('div');
+  aiBubble.className = 'msg-bubble';
+  aiBubble.innerHTML = '<div class="msg-thinking"><span></span><span></span><span></span></div>';
+  aiWrap.appendChild(aiAvatar);
+  aiWrap.appendChild(aiBubble);
+  aiRow.appendChild(aiWrap);
+
+  let fullText = '';
+  let streamStarted = false;
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (state.sessionToken) headers['X-Session-Token'] = state.sessionToken;
+
   try {
-    const res = await api('/api/chat', {
+    const resp = await fetch('/api/chat/stream', {
       method: 'POST',
+      headers,
       body: JSON.stringify({ message: msg, session_id: state.currentSessionId }),
     });
-    const actualSessionId = res.session_id || state.currentSessionId || '';
-    const sessionChanged = actualSessionId !== state.currentSessionId;
-    state.currentSessionId = actualSessionId;
-    if (state.currentSessionId) {
-      localStorage.setItem('pithy.currentSessionId', state.currentSessionId);
-    }
-    appendLine('assistant', res.reply);
-    chatDebug.textContent = JSON.stringify(res.brain || res, null, 2);
 
-    // Sync title if backend generated one
-    if (res.session_name) {
-      const existing = state.sessions.find(s => s.session_id === actualSessionId);
-      if (existing) existing.name = res.session_name;
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      throw new Error(errData.detail || `HTTP ${resp.status}`);
     }
 
-    await loadSessions().catch(() => {});
-    if (sessionChanged) {
-      await switchSession(actualSessionId);
-    } else {
-      updateCurrentSessionLabel();
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+
+      const parts = buf.split('\n\n');
+      buf = parts.pop(); // keep incomplete chunk
+
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith('data:')) continue;
+        let evt;
+        try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
+
+        if (evt.type === 'step') {
+          const stepText = document.getElementById('step-text');
+          if (stepText) {
+            const icon = _stepIcon(evt.step);
+            stepText.textContent = `${icon} ${evt.detail}`;
+          }
+          chatLog.scrollTop = chatLog.scrollHeight;
+
+        } else if (evt.type === 'token') {
+          if (!streamStarted) {
+            // Replace thinking dots with real content
+            aiBubble.innerHTML = '';
+            chatLog.appendChild(aiRow);
+            streamStarted = true;
+          }
+          fullText += evt.text;
+          aiBubble.innerHTML = renderMarkdown(fullText);
+          chatLog.scrollTop = chatLog.scrollHeight;
+
+        } else if (evt.type === 'done') {
+          // Finalize
+          if (!streamStarted) {
+            chatLog.appendChild(aiRow);
+          }
+          enhanceCodeBlocks(aiBubble);
+          const timeEl = document.createElement('span');
+          timeEl.className = 'msg-time';
+          timeEl.textContent = formatTime(new Date());
+          aiRow.appendChild(timeEl);
+
+          chatDebug.textContent = JSON.stringify(evt, null, 2);
+          const actualSessionId = evt.session_id || state.currentSessionId || '';
+          const sessionChanged = actualSessionId !== state.currentSessionId;
+          state.currentSessionId = actualSessionId;
+          if (state.currentSessionId) localStorage.setItem('pithy.currentSessionId', state.currentSessionId);
+          if (evt.session_name) {
+            const existing = state.sessions.find(s => s.session_id === actualSessionId);
+            if (existing) existing.name = evt.session_name;
+          }
+          await loadSessions().catch(() => {});
+          if (sessionChanged) await switchSession(actualSessionId);
+          else updateCurrentSessionLabel();
+
+        } else if (evt.type === 'error') {
+          aiBubble.textContent = evt.message;
+          aiBubble.style.color = 'var(--danger)';
+          if (!streamStarted) chatLog.appendChild(aiRow);
+        }
+      }
     }
   } catch (e) {
     appendLine('error', e.message);
+  } finally {
+    // Remove step indicator
+    const si = document.getElementById('step-indicator');
+    if (si) si.remove();
+    sendBtn.classList.remove('btn-loading');
+    sendBtn.disabled = false;
+    input.disabled = false;
+    input.focus();
   }
 };
+
+function _stepIcon(step) {
+  const icons = {
+    memory: '🧠', think: '💭', thought: '💡', tool: '🔧',
+    tool_done: '✅', answer: '✍️', error: '❌',
+  };
+  return icons[step] || '⚡';
+}
 
 document.getElementById('chat-input').addEventListener('keydown', (event) => {
   const shortcut = ((state.settings && state.settings.send_shortcut) || 'Ctrl+Enter').toLowerCase();
@@ -766,6 +996,33 @@ document.getElementById('chat-input').addEventListener('keydown', (event) => {
     event.preventDefault();
     document.getElementById('send-btn').click();
   }
+});
+
+// Auto-resize & char counter
+function updateCharCounter(el) {
+  const counter = document.getElementById('char-counter');
+  if (!counter) return;
+  const len = el.value.length;
+  const limit = 4000;
+  counter.textContent = len > 200 ? `${len}` : '';
+  counter.classList.toggle('near-limit', len >= limit * 0.8);
+  counter.classList.toggle('at-limit', len >= limit);
+}
+
+const chatInput = document.getElementById('chat-input');
+chatInput.addEventListener('input', () => {
+  autoResizeTextarea(chatInput);
+  updateCharCounter(chatInput);
+});
+
+// Suggestion chips
+document.querySelectorAll('.chip[data-msg]').forEach(chip => {
+  chip.addEventListener('click', () => {
+    chatInput.value = chip.dataset.msg;
+    autoResizeTextarea(chatInput);
+    updateCharCounter(chatInput);
+    chatInput.focus();
+  });
 });
 
 document.getElementById('refresh-history').onclick = () => refreshHistory().catch(e => showError(e.message));

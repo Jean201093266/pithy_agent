@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any
+from typing import Any, Generator
 
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -193,6 +194,122 @@ class LLMClient:
                 provider="wenxin",
                 retryable=False,
                 status_code=502,
+            ) from exc
+
+    def stream(
+        self,
+        prompt: str,
+        cfg: ModelConfig,
+        context: list[dict[str, Any]] | None = None,
+    ) -> Generator[str, None, None]:
+        """Stream tokens from LLM. Yields text chunks."""
+        provider = (cfg.provider or "mock").lower()
+        if provider == "mock":
+            yield from self._mock_stream(prompt, context)
+            return
+        if provider in {"openai", "openai-compatible", "tongyi"}:
+            if provider == "tongyi":
+                cfg = ModelConfig(**{**cfg.__dict__})
+                cfg.base_url = cfg.base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            yield from self._openai_stream(prompt, cfg, context, provider)
+            return
+        # fallback: non-streaming call
+        result = self.call(prompt, cfg, context)
+        yield result
+
+    def _mock_stream(
+        self,
+        prompt: str,
+        context: list[dict[str, Any]] | None = None,
+    ) -> Generator[str, None, None]:
+        """Simulate streaming for mock provider."""
+        import time
+        reply = f"[MockAgent] {'(context=' + str(len(context)) + ') ' if context else ''}{prompt}"
+        words = reply.split()
+        for i, word in enumerate(words):
+            yield ('' if i == 0 else ' ') + word
+            time.sleep(0.04)
+
+    def _openai_stream(
+        self,
+        prompt: str,
+        cfg: ModelConfig,
+        context: list[dict[str, Any]] | None = None,
+        provider: str = "openai",
+    ) -> Generator[str, None, None]:
+        """Stream tokens from OpenAI-compatible API."""
+        if not cfg.api_key:
+            raise LLMProviderError(
+                code="LLM_CONFIG_ERROR",
+                message="api_key is required",
+                provider=provider,
+                retryable=False,
+                status_code=400,
+            )
+        base_url = (cfg.base_url or "").rstrip("/")
+        if not base_url:
+            if provider == "openai":
+                base_url = "https://api.openai.com/v1"
+            else:
+                raise LLMProviderError(
+                    code="LLM_CONFIG_ERROR",
+                    message="base_url is required",
+                    provider=provider,
+                    retryable=False,
+                    status_code=400,
+                )
+
+        messages = [{"role": "system", "content": "You are a helpful local agent."}]
+        if context:
+            for item in context[-8:]:
+                messages.append({"role": item["role"], "content": item["content"]})
+        messages.append({"role": "user", "content": prompt})
+
+        url = f"{base_url}/chat/completions"
+        headers = {"Authorization": f"Bearer {cfg.api_key}"}
+        payload = {
+            "model": cfg.model,
+            "messages": messages,
+            "temperature": cfg.temperature,
+            "max_tokens": cfg.max_tokens,
+            "stream": True,
+        }
+
+        try:
+            with requests.post(
+                url, headers=headers, json=payload,
+                timeout=cfg.timeout_seconds, stream=True,
+            ) as resp:
+                if resp.status_code >= 400:
+                    self._raise_provider_http_error(provider, resp)
+                for raw_line in resp.iter_lines():
+                    if not raw_line:
+                        continue
+                    line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk["choices"][0]["delta"]
+                        text = delta.get("content") or ""
+                        if text:
+                            yield text
+                    except (KeyError, IndexError, json.JSONDecodeError):
+                        continue
+        except LLMProviderError:
+            raise
+        except requests.Timeout as exc:
+            raise LLMProviderError(
+                code="LLM_TIMEOUT", message="request timeout",
+                provider=provider, retryable=True, status_code=504,
+            ) from exc
+        except requests.RequestException as exc:
+            raise LLMProviderError(
+                code="LLM_NETWORK_ERROR", message=f"network error: {exc}",
+                provider=provider, retryable=True, status_code=502,
             ) from exc
 
     def _raise_provider_http_error(self, provider: str, response: requests.Response) -> None:

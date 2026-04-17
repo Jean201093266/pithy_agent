@@ -13,7 +13,7 @@ import psutil
 import yaml
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.core.agent import (
@@ -22,7 +22,6 @@ from app.core.agent import (
     build_react_system_prompt,
     detect_language,
     parse_react_llm_output,
-    react_next_decision,
 )
 from app.core.config_store import AppSettings, ConfigStore, ModelConfig
 from app.core.db import AppDB
@@ -526,7 +525,7 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
                     else:
                         _lg_session_name = _cn
             except Exception as _le:
-                LOGGER.warning("lg auto title failed: %s", _le)
+                APP_LOGGER.warning("lg auto title failed: %s", _le)
             return ChatResponse(
                 session_id=session_id,
                 session_name=_lg_session_name,
@@ -696,7 +695,7 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
             else:
                 session_name = current_name
     except Exception as _e:
-        LOGGER.warning("auto title generation failed: %s", _e)
+        APP_LOGGER.warning("auto title generation failed: %s", _e)
 
     return ChatResponse(
         session_id=session_id,
@@ -722,6 +721,194 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# Streaming chat endpoint  POST /api/chat/stream
+# Sends Server-Sent Events (SSE):
+#   data: {"type":"step","step":"...","detail":"..."}   ← reasoning hint
+#   data: {"type":"token","text":"..."}                 ← LLM token
+#   data: {"type":"done","session_id":"...","session_name":"..."}
+#   data: {"type":"error","message":"..."}
+# ---------------------------------------------------------------------------
+
+def _sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+@app.post("/api/chat/stream")
+def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
+    _require_unlocked(request)
+
+    def generate():
+        import secrets as _secrets, time as _time
+
+        raw_session_id = (payload.session_id or "").strip()
+        session_id = raw_session_id
+        if not session_id:
+            session_id = f"session_{int(_time.time() * 1000)}_{_secrets.token_hex(4)}"
+            db.create_session(session_id, "新会话")
+        else:
+            known = {s["session_id"] for s in db.list_sessions()}
+            if session_id not in known:
+                db.create_session(session_id, session_id)
+
+        language = detect_language(payload.message)
+        cfg = config_store.get_model_config()
+        is_mock = (cfg.provider or "mock").lower() == "mock"
+
+        all_tools = tool_registry.list_tools()
+        enabled_tools = [t for t in all_tools if t.get("enabled", True)]
+        available_tool_names: set[str] = {t["name"] for t in enabled_tools}
+
+        react_trace: list[dict[str, Any]] = []
+        executed_results: list[dict[str, Any]] = []
+        last_result: Any = None
+        final_reply: str = ""
+
+        # ── Step 1: memory retrieval ────────────────────────────────────
+        yield _sse({"type": "step", "step": "memory", "detail": "正在检索记忆上下文…"})
+        db.add_message("user", payload.message, session_id=session_id)
+        memory_ctx = memory_manager.retrieve_context(payload.message, session_id=session_id)
+        memory_prompt = str(memory_ctx.get("memory_prompt") or "").strip()
+        long_term_count = len(memory_ctx.get("long_term") or [])
+        if long_term_count:
+            yield _sse({"type": "step", "step": "memory", "detail": f"召回 {long_term_count} 条相关记忆"})
+
+        MAX_STEPS = 6
+
+        # ── Force-tool path ─────────────────────────────────────────────
+        if payload.force_tool:
+            yield _sse({"type": "step", "step": "tool", "detail": f"强制调用工具: {payload.force_tool}"})
+            call_params = {k: str(v) for k, v in (payload.tool_params or {}).items()}
+            try:
+                result = tool_registry.execute(payload.force_tool, call_params, authorized=True)
+            except Exception as exc:
+                result = {"error": str(exc)}
+            executed_results.append({"tool": payload.force_tool, "params": call_params, "reason": "force_tool", "result": result})
+            react_trace.append({"thought": f"User requested tool: {payload.force_tool}", "action": {"tool": payload.force_tool, "params": call_params}, "observation": result})
+            last_result = result
+            yield _sse({"type": "step", "step": "tool_done", "detail": f"工具 {payload.force_tool} 执行完毕"})
+
+        # ── ReAct loop ───────────────────────────────────────────────────
+        if not is_mock:
+            system_prompt = build_react_system_prompt(enabled_tools)
+            yield _sse({"type": "step", "step": "think", "detail": "开始推理…"})
+
+            for _step in range(MAX_STEPS):
+                question = payload.message if not memory_prompt else f"{payload.message}\n\n[Memory Context]\n{memory_prompt}"
+                scratchpad = build_react_scratchpad(question, react_trace)
+                try:
+                    raw_output = llm_client.call(
+                        scratchpad, cfg,
+                        context=[{"role": "system", "content": system_prompt}],
+                    )
+                except LLMProviderError as exc:
+                    yield _sse({"type": "error", "message": exc.message})
+                    return
+
+                decision = parse_react_llm_output(raw_output, available_tool_names)
+
+                if decision.thought:
+                    yield _sse({"type": "step", "step": "thought", "detail": decision.thought[:200]})
+
+                if decision.should_stop or decision.action is None:
+                    final_reply = decision.final_answer or raw_output
+                    react_trace.append({"thought": decision.thought, "action": None, "observation": {"stop_reason": decision.stop_reason or "final_answer"}})
+                    break
+
+                call = decision.action
+                yield _sse({"type": "step", "step": "tool", "detail": f"调用工具: {call.name}({json.dumps(call.params, ensure_ascii=False)[:80]})"})
+
+                resolved_params: dict[str, Any] = {}
+                for key, value in call.params.items():
+                    if isinstance(value, str) and value.startswith("{{tool:") and value.endswith("}}"):
+                        ref_name = value[7:-2]
+                        ref = next((item for item in reversed(executed_results) if item["tool"] == ref_name), None)
+                        resolved_params[key] = json.dumps(ref["result"], ensure_ascii=False) if ref else ""
+                    else:
+                        resolved_params[key] = value
+
+                try:
+                    result = tool_registry.execute(call.name, resolved_params, authorized=True)
+                except Exception as exc:
+                    result = {"error": str(exc)}
+
+                executed_results.append({"tool": call.name, "params": resolved_params, "reason": call.reason, "result": result})
+                react_trace.append({"thought": decision.thought, "action": {"tool": call.name, "params": resolved_params}, "observation": result})
+                last_result = result
+                yield _sse({"type": "step", "step": "tool_done", "detail": f"工具 {call.name} 返回结果"})
+            else:
+                react_trace.append({"thought": "Max steps reached.", "action": None, "observation": {"stop_reason": "max_steps_reached"}})
+                yield _sse({"type": "step", "step": "think", "detail": "已达最大推理步骤，开始生成回答…"})
+
+        # ── Final streaming answer ───────────────────────────────────────
+        yield _sse({"type": "step", "step": "answer", "detail": "正在生成回答…"})
+
+        if not final_reply:
+            if executed_results:
+                summary_prompt = (
+                    f"用户输入: {payload.message}\n"
+                    f"记忆上下文: {memory_prompt or '无'}\n"
+                    f"ReAct轨迹: {json.dumps(react_trace, ensure_ascii=False)}\n"
+                    f"工具执行结果: {json.dumps(executed_results, ensure_ascii=False)}\n"
+                    f"请根据以上信息给出最终回答。"
+                )
+            else:
+                summary_prompt = payload.message if not memory_prompt else f"{payload.message}\n\n参考记忆:\n{memory_prompt}"
+
+            context_messages = memory_ctx.get("context_messages") or db.list_messages(limit=20, session_id=session_id)
+            tokens: list[str] = []
+            try:
+                for token in llm_client.stream(summary_prompt, cfg, context_messages):
+                    tokens.append(token)
+                    yield _sse({"type": "token", "text": token})
+                final_reply = "".join(tokens)
+            except LLMProviderError as exc:
+                yield _sse({"type": "error", "message": exc.message})
+                return
+        else:
+            # final_reply already known (from ReAct stop), stream it word by word
+            words = final_reply.split()
+            for i, word in enumerate(words):
+                chunk = ('' if i == 0 else ' ') + word
+                yield _sse({"type": "token", "text": chunk})
+
+        # ── Persist & memory update ──────────────────────────────────────
+        db.add_message("assistant", final_reply, session_id=session_id)
+        memory_update = memory_manager.update_after_turn(
+            user_message=payload.message,
+            assistant_reply=final_reply,
+            session_id=session_id,
+            tool_trace=executed_results,
+        )
+
+        # ── Auto-title ───────────────────────────────────────────────────
+        session_name = ""
+        try:
+            session_info = next((s for s in db.list_sessions() if s["session_id"] == session_id), None)
+            if session_info:
+                current_name = session_info.get("name", "")
+                msg_count = int(session_info.get("message_count", 0))
+                if current_name in {"新会话", session_id, "default", ""} or current_name.startswith("session_"):
+                    if msg_count <= 4:
+                        session_name = _generate_session_title(session_id, cfg)
+                        if session_name:
+                            db.rename_session(session_id, session_name)
+                else:
+                    session_name = current_name
+        except Exception as _e:
+            APP_LOGGER.warning("stream auto title failed: %s", _e)
+
+        yield _sse({"type": "done", "session_id": session_id, "session_name": session_name})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 def _generate_session_title(session_id: str, cfg: "ModelConfig | None" = None) -> str:
     """Ask LLM to generate a short title (≤ 15 chars) based on the first few messages."""
     try:
@@ -744,7 +931,7 @@ def _generate_session_title(session_id: str, cfg: "ModelConfig | None" = None) -
         # Truncate to safe length
         return title[:20] if title else ""
     except Exception as exc:
-        LOGGER.warning("_generate_session_title error: %s", exc)
+        APP_LOGGER.warning("_generate_session_title error: %s", exc)
         return ""
 
 

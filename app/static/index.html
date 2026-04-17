@@ -83,19 +83,28 @@
           <div class="chat-empty-icon">✦</div>
           <div class="chat-empty-text">开始一段新的对话</div>
           <div class="chat-empty-sub">支持工具调用、记忆召回和多会话管理</div>
+          <div class="suggestion-chips">
+            <span class="chip" data-msg="帮我分析一段代码">💡 分析代码</span>
+            <span class="chip" data-msg="总结一下我们的对话">📝 总结对话</span>
+            <span class="chip" data-msg="列出可用的工具">🔧 查看工具</span>
+            <span class="chip" data-msg="今天能帮我做什么？">🚀 能力介绍</span>
+          </div>
         </div>
       </div>
 
       <div class="chat-compose">
         <div class="compose-inner">
-          <textarea id="chat-input" rows="3" placeholder="输入消息… (Ctrl+Enter 发送)"></textarea>
+          <textarea id="chat-input" rows="1" placeholder="输入消息…"></textarea>
           <div class="compose-footer">
+            <span class="compose-hint">
+              <kbd>Ctrl</kbd><kbd>Enter</kbd> 发送
+            </span>
+            <span id="char-counter" class="char-counter"></span>
             <button id="refresh-history" class="btn btn-ghost btn-sm" title="刷新历史">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-              刷新
             </button>
             <button id="send-btn" class="btn btn-primary">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
               发送
             </button>
           </div>
@@ -428,7 +437,9 @@
 <div id="toast-container"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
-<script src="/static/app.js?v=20260417g"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/common.min.js"></script>
+<script src="/static/app.js?v=20260417h"></script>
 </body>
 </html>
 
