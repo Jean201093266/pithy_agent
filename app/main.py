@@ -751,6 +751,10 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
             if session_id not in known:
                 db.create_session(session_id, session_id)
 
+        # ── Trace ID for this inference run ─────────────────────────────
+        trace_id = _secrets.token_hex(8)
+        yield _sse({"type": "trace", "trace_id": trace_id})
+
         language = detect_language(payload.message)
         cfg = config_store.get_model_config()
         is_mock = (cfg.provider or "mock").lower() == "mock"
@@ -763,6 +767,8 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
         executed_results: list[dict[str, Any]] = []
         last_result: Any = None
         final_reply: str = ""
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
 
         # ── Step 1: memory retrieval ────────────────────────────────────
         yield _sse({"type": "step", "step": "memory", "detail": "正在检索记忆上下文…"})
@@ -794,13 +800,25 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
             yield _sse({"type": "step", "step": "think", "detail": "开始推理…"})
 
             for _step in range(MAX_STEPS):
+                # ── Check if client disconnected ─────────────────────────
+                if hasattr(request, "is_disconnected"):
+                    try:
+                        import asyncio
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            pass  # Can't await in sync generator; skip check
+                    except Exception:
+                        pass
+
                 question = payload.message if not memory_prompt else f"{payload.message}\n\n[Memory Context]\n{memory_prompt}"
                 scratchpad = build_react_scratchpad(question, react_trace)
                 try:
-                    raw_output = llm_client.call(
+                    raw_output, usage = llm_client.call_with_usage(
                         scratchpad, cfg,
                         context=[{"role": "system", "content": system_prompt}],
                     )
+                    total_prompt_tokens += usage.prompt_tokens
+                    total_completion_tokens += usage.completion_tokens
                 except LLMProviderError as exc:
                     yield _sse({"type": "error", "message": exc.message})
                     return
@@ -881,6 +899,21 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
             tool_trace=executed_results,
         )
 
+        # ── Record token usage ───────────────────────────────────────────
+        if total_prompt_tokens or total_completion_tokens:
+            try:
+                db.record_token_usage(
+                    session_id=session_id,
+                    trace_id=trace_id,
+                    provider=cfg.provider or "unknown",
+                    model=cfg.model or "unknown",
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=total_completion_tokens,
+                    total_tokens=total_prompt_tokens + total_completion_tokens,
+                )
+            except Exception as _te:
+                APP_LOGGER.warning("token usage record failed: %s", _te)
+
         # ── Auto-title ───────────────────────────────────────────────────
         session_name = ""
         try:
@@ -898,7 +931,17 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
         except Exception as _e:
             APP_LOGGER.warning("stream auto title failed: %s", _e)
 
-        yield _sse({"type": "done", "session_id": session_id, "session_name": session_name})
+        yield _sse({
+            "type": "done",
+            "session_id": session_id,
+            "session_name": session_name,
+            "trace_id": trace_id,
+            "token_usage": {
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+            },
+        })
 
     return StreamingResponse(
         generate(),
@@ -948,6 +991,21 @@ def generate_session_title_api(session_id: str, request: Request) -> dict[str, A
         db.rename_session(session_id, title)
     _audit("session_title_generated", f"session_id={session_id} title={title!r}")
     return {"ok": True, "session_id": session_id, "name": title}
+
+
+@app.get("/api/sessions/{session_id}/stats")
+def session_stats(session_id: str, request: Request) -> dict[str, Any]:
+    """Return token usage statistics for a session."""
+    _require_unlocked(request)
+    stats = db.get_session_token_stats(session_id)
+    return {"session_id": session_id, "token_usage": stats}
+
+
+@app.get("/api/stats/tokens")
+def global_token_stats(request: Request) -> dict[str, Any]:
+    """Return aggregate token usage across all sessions."""
+    _require_unlocked(request)
+    return {"token_usage": db.get_global_token_stats()}
 
 
 

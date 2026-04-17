@@ -16,6 +16,9 @@ class AppDB:
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # Enable WAL mode for better concurrent read/write performance
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def _init_schema(self) -> None:
@@ -100,6 +103,20 @@ class AppDB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_memory_items_session
                     ON memory_items(session_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS token_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL DEFAULT 'default',
+                    trace_id TEXT NOT NULL DEFAULT '',
+                    provider TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    latency_ms INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_token_usage_session
+                    ON token_usage(session_id, created_at DESC);
                 """
             )
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()}
@@ -632,3 +649,53 @@ class AppDB:
                 (session_id,),
             )
 
+    # ------------------------------------------------------------------
+    # Token usage tracking
+    # ------------------------------------------------------------------
+
+    def record_token_usage(
+        self,
+        session_id: str,
+        trace_id: str,
+        provider: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        latency_ms: int = 0,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO token_usage
+                   (session_id, trace_id, provider, model,
+                    prompt_tokens, completion_tokens, total_tokens, latency_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, trace_id, provider, model,
+                 prompt_tokens, completion_tokens, total_tokens, latency_ms),
+            )
+
+    def get_session_token_stats(self, session_id: str) -> dict:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT
+                       COUNT(*) as calls,
+                       COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+                       COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+                       COALESCE(SUM(total_tokens), 0) as total_tokens,
+                       COALESCE(AVG(latency_ms), 0) as avg_latency_ms
+                   FROM token_usage WHERE session_id = ?""",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else {}
+
+    def get_global_token_stats(self) -> dict:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT
+                       COUNT(*) as calls,
+                       COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+                       COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+                       COALESCE(SUM(total_tokens), 0) as total_tokens
+                   FROM token_usage""",
+            ).fetchone()
+        return dict(row) if row else {}

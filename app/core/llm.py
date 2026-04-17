@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Generator
 
 import requests
@@ -13,20 +14,52 @@ from app.core.llm_errors import LLMProviderError
 LOGGER = logging.getLogger(__name__)
 
 
+class TokenUsage:
+    """Carries token usage stats from a single LLM call."""
+    __slots__ = ("prompt_tokens", "completion_tokens", "total_tokens", "latency_ms")
+
+    def __init__(self, prompt_tokens: int = 0, completion_tokens: int = 0,
+                 total_tokens: int = 0, latency_ms: int = 0) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = total_tokens or (prompt_tokens + completion_tokens)
+        self.latency_ms = latency_ms
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "latency_ms": self.latency_ms,
+        }
+
+
 class LLMClient:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=5), reraise=True)
     def call(self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None) -> str:
+        reply, _ = self.call_with_usage(prompt, cfg, context)
+        return reply
+
+    def call_with_usage(
+        self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None
+    ) -> tuple[str, TokenUsage]:
+        """Like call() but also returns TokenUsage."""
         provider = (cfg.provider or "mock").lower()
+        t0 = time.monotonic()
         if provider == "mock":
-            return self._mock_reply(prompt, context)
+            reply = self._mock_reply(prompt, context)
+            usage = TokenUsage(latency_ms=int((time.monotonic() - t0) * 1000))
+            return reply, usage
         if provider in {"openai", "openai-compatible"}:
-            return self._openai_compatible_call(prompt, cfg, context, provider)
+            return self._openai_compatible_call_with_usage(prompt, cfg, context, provider)
         if provider == "tongyi":
             tongyi_cfg = ModelConfig(**{**cfg.__dict__})
             tongyi_cfg.base_url = tongyi_cfg.base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
-            return self._openai_compatible_call(prompt, tongyi_cfg, context, provider)
+            return self._openai_compatible_call_with_usage(prompt, tongyi_cfg, context, provider)
         if provider == "wenxin":
-            return self._wenxin_call(prompt, cfg, context)
+            reply = self._wenxin_call(prompt, cfg, context)
+            usage = TokenUsage(latency_ms=int((time.monotonic() - t0) * 1000))
+            return reply, usage
         raise LLMProviderError(
             code="LLM_PROVIDER_UNSUPPORTED",
             message=f"unsupported provider: {cfg.provider}",
@@ -44,6 +77,12 @@ class LLMClient:
     def _openai_compatible_call(
         self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None, provider: str = "openai"
     ) -> str:
+        reply, _ = self._openai_compatible_call_with_usage(prompt, cfg, context, provider)
+        return reply
+
+    def _openai_compatible_call_with_usage(
+        self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None, provider: str = "openai"
+    ) -> tuple[str, TokenUsage]:
         if not cfg.api_key:
             raise LLMProviderError(
                 code="LLM_CONFIG_ERROR",
@@ -81,11 +120,21 @@ class LLMClient:
         }
 
         try:
+            t0 = time.monotonic()
             response = requests.post(url, headers=headers, json=payload, timeout=cfg.timeout_seconds)
+            latency_ms = int((time.monotonic() - t0) * 1000)
             if response.status_code >= 400:
                 self._raise_provider_http_error(provider, response)
             data = response.json()
-            return data["choices"][0]["message"]["content"]
+            reply = data["choices"][0]["message"]["content"]
+            usage_data = data.get("usage") or {}
+            usage = TokenUsage(
+                prompt_tokens=int(usage_data.get("prompt_tokens", 0)),
+                completion_tokens=int(usage_data.get("completion_tokens", 0)),
+                total_tokens=int(usage_data.get("total_tokens", 0)),
+                latency_ms=latency_ms,
+            )
+            return reply, usage
         except LLMProviderError:
             raise
         except (KeyError, IndexError, TypeError, ValueError) as exc:
@@ -335,3 +384,60 @@ class LLMClient:
             raise LLMProviderError("LLM_UPSTREAM_ERROR", message, provider, True, 502)
         raise LLMProviderError("LLM_REQUEST_ERROR", message, provider, False, 400)
 
+    def embed(self, text: str, cfg: ModelConfig) -> list[float]:
+        """Generate a text embedding vector.
+
+        Priority:
+        1. sentence-transformers (local, no API cost)
+        2. OpenAI-compatible /embeddings API
+        3. Fallback: hash-based pseudo-embedding (original behaviour, dims=64)
+        """
+        # --- Try sentence-transformers (local) ---
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            _model = getattr(self, "_st_model", None)
+            if _model is None:
+                self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
+                _model = self._st_model
+            vec = _model.encode(text, normalize_embeddings=True)
+            return vec.tolist()
+        except ImportError:
+            pass
+        except Exception as exc:
+            LOGGER.warning("sentence-transformers embed failed: %s", exc)
+
+        # --- Try OpenAI-compatible embeddings API ---
+        provider = (cfg.provider or "mock").lower()
+        if provider in {"openai", "openai-compatible", "tongyi"} and cfg.api_key:
+            try:
+                base_url = (cfg.base_url or "https://api.openai.com/v1").rstrip("/")
+                if provider == "tongyi":
+                    base_url = base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+                embed_model = "text-embedding-3-small" if provider == "openai" else cfg.model
+                resp = requests.post(
+                    f"{base_url}/embeddings",
+                    headers={"Authorization": f"Bearer {cfg.api_key}"},
+                    json={"model": embed_model, "input": text[:8000]},
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    return resp.json()["data"][0]["embedding"]
+            except Exception as exc:
+                LOGGER.warning("API embed failed: %s", exc)
+
+        # --- Fallback: hash-based pseudo-embedding ---
+        import math as _math
+        import re as _re
+        dims = 64
+        tokens = _re.findall(r"[\w\u4e00-\u9fff]+", text.lower())
+        vec = [0.0] * dims
+        if tokens:
+            for token in tokens:
+                h = hash(token)
+                idx = h % dims
+                sign = 1.0 if (h >> 1) & 1 else -1.0
+                vec[idx] += sign
+            norm = _math.sqrt(sum(v * v for v in vec))
+            if norm > 0:
+                vec = [v / norm for v in vec]
+        return vec

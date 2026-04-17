@@ -804,20 +804,43 @@ class EnhancedMemoryManager:
 
     @staticmethod
     def _embed_text(text: str, dims: int = 64) -> list[float]:
-        """Generate simple embedding for text."""
+        """Generate text embedding.
+
+        Delegates to LLMClient.embed() which tries, in order:
+        1. sentence-transformers (local)
+        2. OpenAI-compatible embeddings API
+        3. Hash-based pseudo-embedding (fallback)
+
+        Since this is a static method called without access to the LLMClient,
+        we replicate the local sentence-transformers + fallback logic here.
+        The LLMClient.embed() method is used by MemoryManager when available.
+        """
+        # Try sentence-transformers
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            if not hasattr(MemoryManager, "_st_model"):
+                MemoryManager._st_model = SentenceTransformer("all-MiniLM-L6-v2")
+            vec = MemoryManager._st_model.encode(text, normalize_embeddings=True)
+            return vec.tolist()
+        except ImportError:
+            pass
+        except Exception as exc:
+            LOGGER.debug("sentence-transformers embed failed: %s", exc)
+
+        # Hash-based fallback
         tokens = re.findall(r"[\w\u4e00-\u9fff]+", text.lower())
         vec = [0.0] * dims
         if not tokens:
             return vec
-
         for token in tokens:
             h = hash(token)
             idx = h % dims
             sign = 1.0 if (h >> 1) & 1 else -1.0
             vec[idx] += sign
-
         norm = math.sqrt(sum(v * v for v in vec))
         if norm <= 0.0:
             return vec
         return [v / norm for v in vec]
+
+
 

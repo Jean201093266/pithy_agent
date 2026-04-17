@@ -10,6 +10,8 @@ const state = {
   logTimer: null,
   currentSessionId: localStorage.getItem('pithy.currentSessionId') || 'default',
   sessions: [],
+  // Abort controller for current SSE stream
+  _abortController: null,
 };
 
 const I18N = {
@@ -839,6 +841,13 @@ async function loadProtectedData() {
   await refreshLogs();
 }
 
+document.getElementById('stop-btn').onclick = () => {
+  if (state._abortController) {
+    state._abortController.abort();
+    state._abortController = null;
+  }
+};
+
 document.getElementById('send-btn').onclick = async () => {
   const input = document.getElementById('chat-input');
   const msg = input.value.trim();
@@ -849,9 +858,14 @@ document.getElementById('send-btn').onclick = async () => {
   updateCharCounter(input);
 
   const sendBtn = document.getElementById('send-btn');
+  const stopBtn = document.getElementById('stop-btn');
   sendBtn.classList.add('btn-loading');
   sendBtn.disabled = true;
+  stopBtn.classList.remove('hidden');
   input.disabled = true;
+
+  // Create abort controller for this request
+  state._abortController = new AbortController();
 
   // Remove old empty state
   const empty = chatLog.querySelector('.chat-empty');
@@ -894,6 +908,7 @@ document.getElementById('send-btn').onclick = async () => {
       method: 'POST',
       headers,
       body: JSON.stringify({ message: msg, session_id: state.currentSessionId }),
+      signal: state._abortController.signal,
     });
 
     if (!resp.ok) {
@@ -919,7 +934,11 @@ document.getElementById('send-btn').onclick = async () => {
         let evt;
         try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
 
-        if (evt.type === 'step') {
+        if (evt.type === 'trace') {
+          // Store trace id for debug
+          chatDebug.textContent = `trace_id: ${evt.trace_id}`;
+
+        } else if (evt.type === 'step') {
           const stepText = document.getElementById('step-text');
           if (stepText) {
             const icon = _stepIcon(evt.step);
@@ -949,6 +968,15 @@ document.getElementById('send-btn').onclick = async () => {
           timeEl.textContent = formatTime(new Date());
           aiRow.appendChild(timeEl);
 
+          // Show token usage badge if available
+          if (evt.token_usage && evt.token_usage.total_tokens > 0) {
+            const usageBadge = document.createElement('div');
+            usageBadge.className = 'token-usage-badge';
+            usageBadge.title = `prompt: ${evt.token_usage.prompt_tokens} + completion: ${evt.token_usage.completion_tokens}`;
+            usageBadge.textContent = `${evt.token_usage.total_tokens} tokens`;
+            aiRow.appendChild(usageBadge);
+          }
+
           chatDebug.textContent = JSON.stringify(evt, null, 2);
           const actualSessionId = evt.session_id || state.currentSessionId || '';
           const sessionChanged = actualSessionId !== state.currentSessionId;
@@ -970,13 +998,25 @@ document.getElementById('send-btn').onclick = async () => {
       }
     }
   } catch (e) {
-    appendLine('error', e.message);
+    if (e.name === 'AbortError') {
+      // User aborted - show subtle indicator
+      if (streamStarted) {
+        enhanceCodeBlocks(aiBubble);
+      } else if (!streamStarted) {
+        aiBubble.innerHTML = '<span style="color:var(--text-3);font-size:12px">已停止生成</span>';
+        chatLog.appendChild(aiRow);
+      }
+    } else {
+      appendLine('error', e.message);
+    }
   } finally {
     // Remove step indicator
     const si = document.getElementById('step-indicator');
     if (si) si.remove();
     sendBtn.classList.remove('btn-loading');
     sendBtn.disabled = false;
+    stopBtn.classList.add('hidden');
+    state._abortController = null;
     input.disabled = false;
     input.focus();
   }

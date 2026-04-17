@@ -863,6 +863,20 @@ pre {
 /* ── Thinking indicator row ───────────────────────────────────────────── */
 #thinking-row { margin-bottom: 4px; }
 
+/* ── Token usage badge ────────────────────────────────────────────────── */
+.token-usage-badge {
+  font-size: 10px;
+  color: var(--text-4);
+  padding: 1px 7px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  margin: 3px 0 0 40px;
+  display: inline-block;
+  cursor: default;
+}
+.msg-row.assistant:hover .token-usage-badge { color: var(--text-3); }
+
 /* ── Send button loading state ────────────────────────────────────────── */
 .btn-loading {
   position: relative;

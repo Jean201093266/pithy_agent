@@ -19,6 +19,46 @@ try:
 except Exception:  # pragma: no cover
     pytesseract = None
 
+# ---------------------------------------------------------------------------
+# Security: allowed base directories for file operations
+# ---------------------------------------------------------------------------
+_ROOT = Path(__file__).resolve().parents[2]
+_ALLOWED_WRITE_ROOTS: list[Path] = [_ROOT / "data"]
+
+# Dangerous command patterns (case-insensitive substring match)
+_CMD_BLACKLIST = [
+    "rm -rf", "del /f", "del /s", "format ", "mkfs",
+    "shutdown", "reboot", "halt", "poweroff",
+    ":(){ :|:& };:", "dd if=",
+    "reg delete", "reg add",
+    "net user", "net localgroup",
+    "chmod 777 /", "chown root",
+    "> /dev/", "> /proc/",
+]
+
+
+def _is_safe_write_path(path: Path) -> bool:
+    """Return True only if the path is under an allowed write root."""
+    resolved = path.resolve()
+    for root in _ALLOWED_WRITE_ROOTS:
+        try:
+            resolved.relative_to(root.resolve())
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _check_command_safety(cmd: str) -> None:
+    """Raise PermissionError if the command matches the blacklist."""
+    lower_cmd = cmd.lower()
+    for pattern in _CMD_BLACKLIST:
+        if pattern in lower_cmd:
+            raise PermissionError(
+                f"Command blocked by security policy (matched pattern: '{pattern}'). "
+                "Use a more specific command or adjust the allowed command list."
+            )
+
 
 def check_ocr_availability() -> dict[str, Any]:
     if Image is None:
@@ -54,7 +94,7 @@ def check_ocr_availability() -> dict[str, Any]:
 def tool_read_file(params: dict[str, Any]) -> dict[str, Any]:
     path = Path(params.get("path", "")).expanduser()
     if not path.exists():
-        raise FileNotFoundError(f"file not found: {path}")
+        raise FileNotFoundError(f"文件不存在: {path}")
     return {"path": str(path), "content": path.read_text(encoding="utf-8")[:5000]}
 
 
@@ -65,6 +105,11 @@ def tool_echo(params: dict[str, Any]) -> dict[str, Any]:
 
 def tool_write_file(params: dict[str, Any]) -> dict[str, Any]:
     path = Path(params.get("path", "")).expanduser()
+    if not _is_safe_write_path(path):
+        allowed = ", ".join(str(r) for r in _ALLOWED_WRITE_ROOTS)
+        raise PermissionError(
+            f"写入路径不在允许范围内: {path}\n允许的目录: {allowed}"
+        )
     content = str(params.get("content", ""))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -98,11 +143,18 @@ def tool_run_command(params: dict[str, Any]) -> dict[str, Any]:
     cmd = str(params.get("command", "")).strip()
     if not cmd:
         raise ValueError("command is required")
-    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20)
+    _check_command_safety(cmd)
+    # Restrict working directory to data/ by default for safety
+    cwd = str(params.get("cwd", _ROOT / "data"))
+    timeout = min(int(params.get("timeout", 20)), 60)
+    proc = subprocess.run(
+        cmd, shell=True, capture_output=True, text=True,
+        timeout=timeout, cwd=cwd,
+    )
     return {
         "returncode": proc.returncode,
         "stdout": proc.stdout[-5000:],
-        "stderr": proc.stderr[-5000:],
+        "stderr": proc.stderr[-2000:],
     }
 
 
@@ -157,3 +209,42 @@ def tool_sqlite_query(params: dict[str, Any]) -> dict[str, Any]:
     return {"db_path": str(db_path), "query": query, "count": len(data), "columns": columns, "rows": data}
 
 
+def tool_http_request(params: dict[str, Any]) -> dict[str, Any]:
+    """Make an HTTP request to any URL. Supports GET/POST/PUT/DELETE."""
+    url = str(params.get("url", "")).strip()
+    if not url:
+        raise ValueError("url is required")
+    method = str(params.get("method", "GET")).upper()
+    if method not in {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"}:
+        raise ValueError(f"unsupported HTTP method: {method}")
+    headers = params.get("headers") or {}
+    if isinstance(headers, str):
+        headers = json.loads(headers)
+    body = params.get("body") or params.get("data")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except json.JSONDecodeError:
+            pass
+    timeout = min(int(params.get("timeout", 15)), 60)
+
+    resp = requests.request(
+        method, url,
+        headers=headers,
+        json=body if isinstance(body, (dict, list)) else None,
+        data=body if isinstance(body, str) else None,
+        timeout=timeout,
+        allow_redirects=True,
+    )
+    try:
+        response_body = resp.json()
+    except Exception:
+        response_body = resp.text[:10000]
+
+    return {
+        "url": url,
+        "method": method,
+        "status_code": resp.status_code,
+        "headers": dict(resp.headers),
+        "body": response_body,
+    }

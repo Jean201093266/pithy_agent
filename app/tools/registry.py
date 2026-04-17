@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from app.core.db import AppDB
@@ -8,6 +9,7 @@ from app.tools.base import MCPServerConfig, MCPToolResult, ToolManifest, ToolSpe
 from app.tools.builtin import (
     tool_echo,
     tool_capture_screenshot,
+    tool_http_request,
     tool_json_parse,
     tool_ocr_image,
     tool_read_file,
@@ -110,6 +112,20 @@ _BUILTIN_SPECS: list[tuple[str, str, str, Any, dict[str, Any]]] = [
         "high",
         tool_capture_screenshot,
         _schema(output=_str_prop("Destination image path (default: data/screenshot.png)")),
+    ),
+    (
+        "http_request",
+        "Make an HTTP request (GET/POST/PUT/DELETE) to a URL and return the response",
+        "normal",
+        tool_http_request,
+        _schema(
+            "url",
+            url=_str_prop("Request URL"),
+            method=_str_prop("HTTP method: GET, POST, PUT, DELETE, PATCH (default: GET)"),
+            headers={"type": "object", "description": "Optional request headers as JSON object"},
+            body=_str_prop("Optional request body (JSON string or object for POST/PUT)"),
+            timeout={"type": "integer", "description": "Timeout in seconds (max 60, default 15)"},
+        ),
     ),
 ]
 
@@ -316,7 +332,42 @@ class ToolRegistry:
     # Execution
     # ------------------------------------------------------------------
 
-    def execute(self, name: str, params: dict[str, Any], authorized: bool = False) -> Any:
+    # Friendly error messages for common exceptions
+    _ERROR_MAP: dict[type, str] = {
+        FileNotFoundError: "文件不存在，请检查路径是否正确",
+        PermissionError: "权限不足，操作被拒绝",
+        TimeoutError: "工具执行超时，请稍后重试",
+        ConnectionError: "网络连接失败，请检查网络",
+        ValueError: "参数错误",
+    }
+
+    @staticmethod
+    def _friendly_error(exc: Exception) -> str:
+        for exc_type, msg in ToolRegistry._ERROR_MAP.items():
+            if isinstance(exc, exc_type):
+                detail = str(exc)
+                return f"{msg}: {detail}" if detail else msg
+        return str(exc)
+
+    def execute(self, name: str, params: dict[str, Any], authorized: bool = False,
+                _retry: int = 2) -> Any:
+        """Execute a tool with optional retry for transient errors."""
+        last_exc: Exception | None = None
+        for attempt in range(max(1, _retry)):
+            try:
+                return self._execute_once(name, params, authorized)
+            except (PermissionError, KeyError):
+                raise  # Non-retryable
+            except (ConnectionError, TimeoutError, OSError) as exc:
+                last_exc = exc
+                if attempt < _retry - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    LOGGER.warning("Tool %s attempt %d failed: %s — retrying", name, attempt + 1, exc)
+            except Exception as exc:
+                raise RuntimeError(self._friendly_error(exc)) from exc
+        raise RuntimeError(self._friendly_error(last_exc)) from last_exc  # type: ignore[arg-type]
+
+    def _execute_once(self, name: str, params: dict[str, Any], authorized: bool = False) -> Any:
         # MCP tool
         if name in self._mcp_tools:
             if not self.db.is_tool_enabled(name, default=True):
