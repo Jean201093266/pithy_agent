@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from app.core.agent import build_react_scratchpad, build_react_system_prompt, parse_react_llm_output
@@ -8,6 +9,8 @@ from app.core.config_store import ModelConfig
 from app.core.langchain_adapter import LangChainAdapter
 from app.core.memory import MemoryManager
 from app.core.llm_errors import LLMProviderError
+
+LOGGER = logging.getLogger(__name__)
 
 try:
     from langgraph.graph import END, StateGraph
@@ -128,26 +131,22 @@ class ChatGraphEngine:
             for _ in range(max_steps):
                 scratchpad = build_react_scratchpad(question, react_trace)
                 try:
-                    raw_output = llm.invoke(
-                        {
-                            "prompt": scratchpad,
-                            "cfg": cfg,
-                            "context": [{"role": "system", "content": system_prompt}],
-                        }
-                    )
+                    raw_output = llm.invoke({
+                        "prompt": scratchpad,
+                        "cfg": cfg,
+                        "context": [{"role": "system", "content": system_prompt}],
+                    })
                 except LLMProviderError:
                     raise
 
                 decision = parse_react_llm_output(raw_output, available_tool_names)
                 if decision.should_stop or decision.action is None:
                     final_reply = decision.final_answer or raw_output
-                    react_trace.append(
-                        {
-                            "thought": decision.thought,
-                            "action": None,
-                            "observation": {"stop_reason": decision.stop_reason or "final_answer"},
-                        }
-                    )
+                    react_trace.append({
+                        "thought": decision.thought,
+                        "action": None,
+                        "observation": {"stop_reason": decision.stop_reason or "final_answer"},
+                    })
                     break
 
                 call = decision.action
@@ -165,21 +164,17 @@ class ChatGraphEngine:
                 except Exception as exc:
                     result = {"error": str(exc)}
 
-                executed_results.append(
-                    {
-                        "tool": call.name,
-                        "params": resolved_params,
-                        "reason": call.reason,
-                        "result": result,
-                    }
-                )
-                react_trace.append(
-                    {
-                        "thought": decision.thought,
-                        "action": {"tool": call.name, "params": resolved_params},
-                        "observation": result,
-                    }
-                )
+                executed_results.append({
+                    "tool": call.name,
+                    "params": resolved_params,
+                    "reason": call.reason,
+                    "result": result,
+                })
+                react_trace.append({
+                    "thought": decision.thought,
+                    "action": {"tool": call.name, "params": resolved_params},
+                    "observation": result,
+                })
                 last_result = result
 
         if not final_reply:
@@ -218,3 +213,113 @@ class ChatGraphEngine:
         state["memory_update"] = memory_update
         return state
 
+
+class ChatGraphEngineWithEnhancedMemory(ChatGraphEngine):
+    """
+    Extended ChatGraphEngine with hierarchical memory retrieval, ranking, and reflection.
+    
+    This subclass replaces the basic MemoryManager with EnhancedMemoryManager to provide:
+    - Hierarchical context (core/summary/retrieval layers)
+    - Composite importance scoring
+    - Memory deduplication
+    - Reflection mechanism
+    - Dynamic retrieval strategies
+    """
+    
+    def __init__(self, adapter: LangChainAdapter, memory_manager: MemoryManager, use_enhanced: bool = True) -> None:
+        super().__init__(adapter, memory_manager)
+        self.use_enhanced = use_enhanced
+        
+        if use_enhanced:
+            self._init_enhanced_memory()
+    
+    def _init_enhanced_memory(self) -> None:
+        """Initialize enhanced memory manager."""
+        try:
+            from app.core.memory_enhanced import EnhancedMemoryManager, EnhancedMemoryConfig
+            
+            self.enhanced_memory = EnhancedMemoryManager(
+                self.memory_manager.db,
+                config=EnhancedMemoryConfig(),
+            )
+            LOGGER.info("Enhanced memory system initialized")
+        except ImportError:
+            LOGGER.warning("Enhanced memory system not available, falling back to basic mode")
+            self.enhanced_memory = None
+            self.use_enhanced = False
+    
+    def _node_retrieve(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Retrieve context using enhanced memory if available."""
+        session_id = str(state["session_id"])
+        message = str(state["message"])
+        self.memory_manager.db.add_message("user", message, session_id=session_id)
+        
+        if self.use_enhanced and self.enhanced_memory:
+            # Use enhanced hierarchical retrieval
+            memory_ctx = self.enhanced_memory.retrieve_context(
+                message=message,
+                session_id=session_id,
+                complexity="medium",
+            )
+        else:
+            # Fall back to basic retrieval
+            memory_ctx = self.memory_manager.retrieve_context(message, session_id=session_id)
+        
+        state["memory_ctx"] = memory_ctx
+        state["memory_prompt"] = str(memory_ctx.get("memory_prompt") or "")
+        return state
+    
+    def _node_update(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Update memory using enhanced manager if available."""
+        session_id = str(state["session_id"])
+        final_reply = str(state.get("final_reply") or "")
+        message = str(state.get("message") or "")
+        executed_results = state.get("executed_results") or []
+        
+        self.memory_manager.db.add_message("assistant", final_reply, session_id=session_id)
+        
+        if self.use_enhanced and self.enhanced_memory:
+            # Use enhanced update with reflection
+            success = not any(
+                word in final_reply.lower()
+                for word in ["error", "fail", "unable", "无法", "错误"]
+            )
+            memory_update = self.enhanced_memory.update_after_turn(
+                user_message=message,
+                assistant_reply=final_reply,
+                session_id=session_id,
+                tool_trace=executed_results,
+                success=success,
+            )
+        else:
+            # Fall back to basic update
+            memory_update = self.memory_manager.update_after_turn(
+                user_message=message,
+                assistant_reply=final_reply,
+                session_id=session_id,
+                tool_trace=executed_results,
+            )
+        
+        state["memory_update"] = memory_update
+        return state
+
+
+def create_chat_graph_engine(
+    adapter: LangChainAdapter,
+    memory_manager: MemoryManager,
+    use_enhanced_memory: bool = True,
+) -> ChatGraphEngine:
+    """
+    Factory function to create appropriate ChatGraphEngine.
+    
+    Args:
+        adapter: LangChainAdapter instance
+        memory_manager: MemoryManager instance
+        use_enhanced_memory: Whether to use enhanced memory system (default True)
+    
+    Returns:
+        ChatGraphEngine or ChatGraphEngineWithEnhancedMemory
+    """
+    if use_enhanced_memory:
+        return ChatGraphEngineWithEnhancedMemory(adapter, memory_manager, use_enhanced=True)
+    return ChatGraphEngine(adapter, memory_manager)
