@@ -938,6 +938,51 @@ document.getElementById('send-btn').onclick = async () => {
           // Store trace id for debug
           chatDebug.textContent = `trace_id: ${evt.trace_id}`;
 
+        } else if (evt.type === 'plan') {
+          // Render plan as a collapsible card above the AI bubble
+          const planCard = document.createElement('div');
+          planCard.className = 'plan-card';
+          const header = document.createElement('div');
+          header.className = 'plan-card-header';
+          header.innerHTML = `<span class="plan-icon">🗺</span><strong>执行计划</strong><span class="plan-badge">${evt.steps.length} 步</span><span class="plan-toggle">▾</span>`;
+          const body = document.createElement('div');
+          body.className = 'plan-card-body';
+          (evt.steps || []).forEach(s => {
+            const item = document.createElement('div');
+            item.className = 'plan-step-item';
+            item.dataset.stepIndex = s.index;
+            const typeIcon = s.type === 'tool' ? '🔧' : '💭';
+            item.innerHTML = `<span class="plan-step-num">${s.index}</span><span class="plan-step-icon">${typeIcon}</span><span class="plan-step-task">${s.task}</span>${s.tool ? `<span class="plan-step-tool">${s.tool}</span>` : ''}`;
+            body.appendChild(item);
+          });
+          header.onclick = () => {
+            body.classList.toggle('hidden');
+            header.querySelector('.plan-toggle').textContent = body.classList.contains('hidden') ? '▸' : '▾';
+          };
+          planCard.appendChild(header);
+          planCard.appendChild(body);
+          const si = document.getElementById('step-indicator');
+          if (si) chatLog.insertBefore(planCard, si);
+          else chatLog.appendChild(planCard);
+          chatLog.scrollTop = chatLog.scrollHeight;
+
+        } else if (evt.type === 'step_start') {
+          // Highlight the active plan step
+          const stepEl = document.querySelector(`.plan-step-item[data-step-index="${evt.index}"]`);
+          if (stepEl) {
+            document.querySelectorAll('.plan-step-item.active').forEach(el => el.classList.remove('active'));
+            stepEl.classList.add('active');
+          }
+
+        } else if (evt.type === 'step_done') {
+          // Mark step as complete
+          const stepEl = document.querySelector(`.plan-step-item[data-step-index="${evt.index}"]`);
+          if (stepEl) {
+            stepEl.classList.remove('active');
+            stepEl.classList.add('done');
+            stepEl.querySelector('.plan-step-icon').textContent = '✅';
+          }
+
         } else if (evt.type === 'step') {
           const stepText = document.getElementById('step-text');
           if (stepText) {

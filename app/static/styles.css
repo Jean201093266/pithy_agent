@@ -877,6 +877,71 @@ pre {
 }
 .msg-row.assistant:hover .token-usage-badge { color: var(--text-3); }
 
+/* ── Plan card ────────────────────────────────────────────────────────── */
+.plan-card {
+  margin: 4px 20px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  overflow: hidden;
+  font-size: 12px;
+}
+.plan-card-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  cursor: pointer;
+  user-select: none;
+  color: var(--text-2);
+  background: var(--surface-3);
+}
+.plan-card-header:hover { background: var(--surface-4, var(--surface-3)); }
+.plan-icon { font-size: 13px; }
+.plan-badge {
+  font-size: 10px;
+  background: var(--accent-t);
+  color: var(--accent);
+  border: 1px solid var(--accent-b);
+  border-radius: 999px;
+  padding: 0 6px;
+  font-weight: 700;
+}
+.plan-toggle { margin-left: auto; color: var(--text-4); font-size: 11px; }
+.plan-card-body { padding: 6px 0; }
+.plan-step-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 14px;
+  color: var(--text-3);
+  transition: background .1s;
+}
+.plan-step-item.active {
+  background: rgba(var(--accent-rgb, 99,102,241), .06);
+  color: var(--text-1);
+}
+.plan-step-item.done { color: var(--text-4); }
+.plan-step-num {
+  width: 18px; height: 18px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  background: var(--surface-3);
+  font-size: 10px; font-weight: 700;
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+.plan-step-icon { flex-shrink: 0; font-size: 12px; }
+.plan-step-task { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plan-step-tool {
+  font-size: 10px; padding: 1px 6px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-4);
+  flex-shrink: 0;
+}
+
 /* ── Send button loading state ────────────────────────────────────────── */
 .btn-loading {
   position: relative;
