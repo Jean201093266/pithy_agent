@@ -32,14 +32,15 @@ def test_health_ok() -> None:
 
 def test_chat_ok() -> None:
     _set_mock_config()
-    resp = client.post('/api/chat', json={'message': 'hello'})
+    resp = client.post('/api/chat', json={'message': 'hello', 'session_id': 'smoke'})
     assert resp.status_code == 200
     body = resp.json()
     assert 'reply' in body
     assert isinstance(body['plan'], list)
     assert 'brain' in body
-    assert body['brain']['strategy'] in ('react-primary+plan-exec-lite', 'mock-react', 'llm-react')
+    assert body['brain']['strategy'] in ('react-primary+plan-exec-lite', 'mock-react', 'llm-react', 'langgraph-react')
     assert isinstance(body['brain'].get('react_trace', []), list)
+    assert body['brain'].get('memory', {}).get('session_id') == 'smoke'
 
 
 def test_tools_list_ok() -> None:

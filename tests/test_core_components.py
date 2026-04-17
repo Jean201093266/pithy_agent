@@ -1,8 +1,12 @@
 from pathlib import Path
 
 from app.core.agent import build_light_plan_exec, build_plan, detect_language, react_next_decision
+from app.core.chat_graph import ChatGraphEngine
+from app.core.langchain_adapter import LangChainAdapter
 from app.core.config_store import AppSettings, ConfigStore, ModelConfig
 from app.core.db import AppDB
+from app.core.llm import LLMClient
+from app.core.memory import MemoryManager
 from app.tools.registry import ToolRegistry
 
 
@@ -15,6 +19,20 @@ def test_db_and_config_roundtrip(tmp_path: Path) -> None:
     loaded = store.get_model_config()
     assert loaded.api_key == 'abc123'
     assert loaded.provider == 'mock'
+
+
+def test_session_scoped_messages(tmp_path: Path) -> None:
+    db = AppDB(tmp_path / 'agent.db')
+    db.add_message('user', 'hello s1', session_id='s1')
+    db.add_message('assistant', 'reply s1', session_id='s1')
+    db.add_message('user', 'hello s2', session_id='s2')
+
+    s1 = db.list_messages(limit=10, session_id='s1')
+    s2 = db.list_messages(limit=10, session_id='s2')
+    assert len(s1) == 2
+    assert len(s2) == 1
+    assert s1[0]['content'] == 'hello s1'
+    assert s2[0]['content'] == 'hello s2'
 
 
 def test_wenxin_secret_key_roundtrip(tmp_path: Path) -> None:
@@ -111,5 +129,47 @@ def test_skill_version_history_and_rollback(tmp_path: Path) -> None:
     active = db.get_skill(skill_id)
     assert active is not None
     assert active['version'] == '1.0.0'
+
+
+def test_memory_manager_retrieve_and_update(tmp_path: Path) -> None:
+    db = AppDB(tmp_path / 'agent.db')
+    mgr = MemoryManager(db)
+
+    db.add_message('user', '我喜欢简洁回答', session_id='demo')
+    db.add_message('assistant', '好的，我会简洁。', session_id='demo')
+
+    upd = mgr.update_after_turn(
+        user_message='我的项目路径是 D:/work/demo',
+        assistant_reply='已记录你的项目路径。',
+        session_id='demo',
+        tool_trace=[{'tool': 'echo'}],
+    )
+    assert 'state' in upd
+
+    out = mgr.retrieve_context('项目路径是什么', session_id='demo')
+    assert 'short_term' in out
+    assert 'long_term' in out
+    assert isinstance(out['context_messages'], list)
+
+
+def test_langgraph_engine_mock_run_if_available(tmp_path: Path) -> None:
+    db = AppDB(tmp_path / 'agent.db')
+    tools = ToolRegistry(db)
+    adapter = LangChainAdapter(llm_client=LLMClient(), tool_registry=tools)
+    engine = ChatGraphEngine(adapter=adapter, memory_manager=MemoryManager(db))
+    if not engine.available:
+        assert engine.available is False
+        return
+
+    out = engine.run(
+        message='hello graph',
+        cfg=ModelConfig(provider='mock', model='mock-model'),
+        session_id='graph-test',
+        force_tool=None,
+        tool_params={},
+        enabled_tools=[t for t in tools.list_tools() if t.get('enabled', True)],
+        is_mock=True,
+    )
+    assert isinstance(out.get('final_reply'), str)
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ class AppDB:
                 );
                 CREATE TABLE IF NOT EXISTS conversations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL DEFAULT 'default',
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -68,7 +70,37 @@ class AppDB:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS conversation_summaries (
+                    session_id TEXT PRIMARY KEY,
+                    summary TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS conversation_state (
+                    session_id TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS memory_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL DEFAULT 'default',
+                    memory_type TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    importance REAL NOT NULL DEFAULT 0.5,
+                    embedding_json TEXT NOT NULL DEFAULT '[]',
+                    access_count INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_items_session
+                    ON memory_items(session_id, created_at DESC);
                 """
+            )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()}
+            if "session_id" not in columns:
+                conn.execute("ALTER TABLE conversations ADD COLUMN session_id TEXT NOT NULL DEFAULT 'default'")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversations_session_id ON conversations(session_id, id DESC)"
             )
 
     def get_kv(self, key: str) -> str | None:
@@ -84,17 +116,149 @@ class AppDB:
                 (key, value),
             )
 
-    def add_message(self, role: str, content: str) -> None:
+    def add_message(self, role: str, content: str, session_id: str = "default") -> None:
         with self.connect() as conn:
-            conn.execute("INSERT INTO conversations(role, content) VALUES(?, ?)", (role, content))
+            conn.execute(
+                "INSERT INTO conversations(session_id, role, content) VALUES(?, ?, ?)",
+                (session_id or "default", role, content),
+            )
 
-    def list_messages(self, limit: int = 30) -> list[dict[str, Any]]:
+    def list_messages(self, limit: int = 30, session_id: str = "default") -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT role, content, created_at FROM conversations ORDER BY id DESC LIMIT ?",
-                (limit,),
+                "SELECT role, content, created_at FROM conversations WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                (session_id or "default", limit),
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
+
+    def get_conversation_summary(self, session_id: str = "default") -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT summary FROM conversation_summaries WHERE session_id = ?",
+                (session_id or "default",),
+            ).fetchone()
+        return "" if row is None else str(row["summary"])
+
+    def save_conversation_summary(self, summary: str, session_id: str = "default") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO conversation_summaries(session_id, summary) VALUES(?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET summary = excluded.summary, updated_at = CURRENT_TIMESTAMP",
+                (session_id or "default", summary),
+            )
+
+    def get_conversation_state(self, session_id: str = "default") -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT state_json FROM conversation_state WHERE session_id = ?",
+                (session_id or "default",),
+            ).fetchone()
+        if row is None:
+            return {}
+        try:
+            parsed = json.loads(row["state_json"])
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def save_conversation_state(self, state: dict[str, Any], session_id: str = "default") -> None:
+        serialized = json.dumps(state, ensure_ascii=False)
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO conversation_state(session_id, state_json) VALUES(?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET state_json = excluded.state_json, updated_at = CURRENT_TIMESTAMP",
+                (session_id or "default", serialized),
+            )
+
+    def add_memory_item(
+        self,
+        memory_type: str,
+        text: str,
+        payload: dict[str, Any] | None = None,
+        importance: float = 0.5,
+        embedding: list[float] | None = None,
+        session_id: str = "default",
+    ) -> int:
+        safe_importance = max(0.0, min(float(importance), 1.0))
+        payload_json = json.dumps(payload or {}, ensure_ascii=False)
+        embedding_json = json.dumps(embedding or [], ensure_ascii=False)
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO memory_items(session_id, memory_type, text, payload_json, importance, embedding_json) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (session_id or "default", memory_type, text, payload_json, safe_importance, embedding_json),
+            )
+            return int(cur.lastrowid)
+
+    def list_memory_items(self, session_id: str = "default", limit: int = 300) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, session_id, memory_type, text, payload_json, importance, embedding_json, access_count, "
+                "created_at, updated_at FROM memory_items WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                (session_id or "default", max(1, min(limit, 2000))),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "session_id": row["session_id"],
+                "memory_type": row["memory_type"],
+                "text": row["text"],
+                "payload": json.loads(row["payload_json"] or "{}"),
+                "importance": float(row["importance"]),
+                "embedding": json.loads(row["embedding_json"] or "[]"),
+                "access_count": int(row["access_count"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def touch_memory_items(self, memory_ids: list[int]) -> None:
+        if not memory_ids:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                "UPDATE memory_items SET access_count = access_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                [(mid,) for mid in memory_ids],
+            )
+
+    def delete_memory_item(self, memory_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM memory_items WHERE id = ?", (memory_id,))
+
+    def find_similar_memories(
+        self,
+        query_embedding: list[float],
+        session_id: str = "default",
+        top_k: int = 6,
+        min_importance: float = 0.2,
+    ) -> list[dict[str, Any]]:
+        items = self.list_memory_items(session_id=session_id, limit=800)
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for item in items:
+            if float(item.get("importance", 0.0)) < min_importance:
+                continue
+            emb = item.get("embedding")
+            if not isinstance(emb, list) or not emb:
+                continue
+            sim = self._cosine_similarity(query_embedding, [float(x) for x in emb])
+            recency_bonus = 1.0 / (1.0 + math.log1p(max(item.get("access_count", 0), 0)))
+            score = sim * 0.85 + float(item["importance"]) * 0.1 + recency_bonus * 0.05
+            scored.append((score, item))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [item for _, item in scored[: max(1, min(top_k, 20))]]
+
+    @staticmethod
+    def _cosine_similarity(a: list[float], b: list[float]) -> float:
+        size = min(len(a), len(b))
+        if size == 0:
+            return 0.0
+        dot = sum(float(a[i]) * float(b[i]) for i in range(size))
+        norm_a = math.sqrt(sum(float(a[i]) * float(a[i]) for i in range(size)))
+        norm_b = math.sqrt(sum(float(b[i]) * float(b[i]) for i in range(size)))
+        if norm_a <= 0.0 or norm_b <= 0.0:
+            return 0.0
+        return dot / (norm_a * norm_b)
 
     def set_tool_enabled(self, name: str, enabled: bool) -> None:
         with self.connect() as conn:

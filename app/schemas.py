@@ -91,6 +91,7 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     force_tool: str | None = None
     tool_params: dict[str, Any] = Field(default_factory=dict)
+    session_id: str = Field(default="default", min_length=1, max_length=120)
 
 
 class ChatResponse(BaseModel):

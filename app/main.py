@@ -24,8 +24,11 @@ from app.core.agent import (
 )
 from app.core.config_store import AppSettings, ConfigStore, ModelConfig
 from app.core.db import AppDB
+from app.core.langchain_adapter import LangChainAdapter
 from app.core.llm import LLMClient
 from app.core.llm_errors import LLMProviderError
+from app.core.chat_graph import ChatGraphEngine
+from app.core.memory import MemoryManager
 from app.schemas import (
     ChatRequest,
     ChatResponse,
@@ -89,7 +92,10 @@ app.mount("/static", StaticFiles(directory=ROOT / "app" / "static"), name="stati
 db = AppDB(DATA_DIR / "agent.db")
 config_store = ConfigStore(db, DATA_DIR / "secret.key")
 llm_client = LLMClient()
+memory_manager = MemoryManager(db)
 tool_registry = ToolRegistry(db)
+langchain_adapter = LangChainAdapter(llm_client, tool_registry)
+chat_graph_engine = ChatGraphEngine(langchain_adapter, memory_manager)
 skill_runtime = SkillRuntime(db, config_store, llm_client, tool_registry)
 APP_LOGGER = logging.getLogger("pithy_agent")
 AUTH_STATE: dict[str, Any] = {
@@ -438,8 +444,8 @@ def delete_mcp_server(server_id: str, request: Request) -> MCPServerDeleteRespon
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     _require_unlocked(request)
+    session_id = (payload.session_id or "default").strip() or "default"
     language = detect_language(payload.message)
-    db.add_message("user", payload.message)
 
     cfg = config_store.get_model_config()
     is_mock = (cfg.provider or "mock").lower() == "mock"
@@ -453,6 +459,54 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     executed_results: list[dict[str, Any]] = []
     last_result: Any | None = None
     final_reply: str = ""
+
+    use_langgraph = chat_graph_engine.available
+    if use_langgraph:
+        try:
+            graph_out = chat_graph_engine.run(
+                message=payload.message,
+                cfg=cfg,
+                session_id=session_id,
+                force_tool=payload.force_tool,
+                tool_params=payload.tool_params,
+                enabled_tools=enabled_tools,
+                is_mock=is_mock,
+            )
+            react_trace = list(graph_out.get("react_trace") or [])
+            executed_results = list(graph_out.get("executed_results") or [])
+            last_result = graph_out.get("last_result")
+            final_reply = str(graph_out.get("final_reply") or "")
+            memory_update = dict(graph_out.get("memory_update") or {})
+
+            plan_exec = build_light_plan_exec(payload.message)
+            return ChatResponse(
+                language=language,
+                plan=list(plan_exec.get("plan") or []),
+                used_tool=executed_results[-1]["tool"] if executed_results else None,
+                tool_result=last_result,
+                reply=final_reply,
+                brain={
+                    **plan_exec,
+                    "strategy": "langgraph-react",
+                    "react_trace": react_trace,
+                    "executed_tools": executed_results,
+                    "memory": {
+                        "session_id": session_id,
+                        "short_term_messages": len(((graph_out.get("memory_ctx") or {}).get("short_term") or {}).get("messages") or []),
+                        "retrieved_long_term": len((graph_out.get("memory_ctx") or {}).get("long_term") or []),
+                        "summary": memory_update.get("summary") or "",
+                        "state": memory_update.get("state") or {},
+                    },
+                },
+            )
+        except LLMProviderError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
+        except Exception:
+            APP_LOGGER.exception("LangGraph chat path failed, falling back to legacy flow.")
+
+    db.add_message("user", payload.message, session_id=session_id)
+    memory_ctx = memory_manager.retrieve_context(payload.message, session_id=session_id)
+    memory_prompt = str(memory_ctx.get("memory_prompt") or "").strip()
 
     MAX_STEPS = 6
 
@@ -485,7 +539,8 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
         system_prompt = build_react_system_prompt(enabled_tools)
 
         for _step in range(MAX_STEPS):
-            scratchpad = build_react_scratchpad(payload.message, react_trace)
+            question = payload.message if not memory_prompt else f"{payload.message}\n\n[Memory Context]\n{memory_prompt}"
+            scratchpad = build_react_scratchpad(question, react_trace)
             try:
                 raw_output = llm_client.call(
                     scratchpad,
@@ -549,18 +604,26 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
         if executed_results:
             summary_prompt = (
                 f"用户输入: {payload.message}\n"
+                f"记忆上下文: {memory_prompt or '无'}\n"
                 f"ReAct轨迹: {json.dumps(react_trace, ensure_ascii=False)}\n"
                 f"工具执行结果: {json.dumps(executed_results, ensure_ascii=False)}\n"
                 f"请根据以上信息给出最终回答。"
             )
         else:
-            summary_prompt = payload.message
+            summary_prompt = payload.message if not memory_prompt else f"{payload.message}\n\n参考记忆:\n{memory_prompt}"
         try:
-            final_reply = llm_client.call(summary_prompt, cfg, db.list_messages(limit=20))
+            context_messages = memory_ctx.get("context_messages") or db.list_messages(limit=20, session_id=session_id)
+            final_reply = llm_client.call(summary_prompt, cfg, context_messages)
         except LLMProviderError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
 
-    db.add_message("assistant", final_reply)
+    db.add_message("assistant", final_reply, session_id=session_id)
+    memory_update = memory_manager.update_after_turn(
+        user_message=payload.message,
+        assistant_reply=final_reply,
+        session_id=session_id,
+        tool_trace=executed_results,
+    )
 
     # Build a lightweight plan_exec dict for response compatibility
     plan_exec = build_light_plan_exec(payload.message)
@@ -576,6 +639,13 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
             "strategy": "llm-react" if not is_mock else "mock-react",
             "react_trace": react_trace,
             "executed_tools": executed_results,
+            "memory": {
+                "session_id": session_id,
+                "short_term_messages": len((memory_ctx.get("short_term") or {}).get("messages") or []),
+                "retrieved_long_term": len(memory_ctx.get("long_term") or []),
+                "summary": memory_update.get("summary") or "",
+                "state": memory_update.get("state") or {},
+            },
         },
     )
 
