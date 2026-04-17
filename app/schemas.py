@@ -91,10 +91,12 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     force_tool: str | None = None
     tool_params: dict[str, Any] = Field(default_factory=dict)
-    session_id: str = Field(default="default", min_length=1, max_length=120)
+    session_id: str = Field(default="", max_length=120)
 
 
 class ChatResponse(BaseModel):
+    session_id: str
+    session_name: str = ""
     language: str
     plan: list[str]
     used_tool: str | None
@@ -199,6 +201,16 @@ class SkillRollbackResponse(BaseModel):
     version_id: int
 
 
+class SkillStatePatch(BaseModel):
+    enabled: bool
+
+
+class SkillPackageImportResponse(BaseModel):
+    ok: bool
+    imported: int
+    skills: list[dict]
+
+
 # ---------------------------------------------------------------------------
 # MCP server schemas
 # ---------------------------------------------------------------------------
@@ -234,5 +246,36 @@ class MCPServerRegisterResponse(BaseModel):
 class MCPServerDeleteResponse(BaseModel):
     ok: bool
     server_id: str
+
+
+# ---------------------------------------------------------------------------
+# Chat session schemas
+# ---------------------------------------------------------------------------
+
+class SessionCreateRequest(BaseModel):
+    session_id: str = Field(default="", max_length=120)
+    name: str = Field(default="", max_length=120)
+
+
+class SessionRenameRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
+class SessionItem(BaseModel):
+    session_id: str
+    name: str
+    message_count: int
+    created_at: str
+    updated_at: str
+
+
+class SessionListResponse(BaseModel):
+    sessions: list[SessionItem]
+
+
+class SessionResponse(BaseModel):
+    ok: bool
+    session_id: str
+    name: str
 
 

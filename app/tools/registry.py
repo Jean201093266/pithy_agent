@@ -158,6 +158,16 @@ class ToolRegistry:
         self.reload_custom_tools()
         return manifest
 
+    def delete_custom_tool(self, tool_name: str) -> None:
+        """Remove a custom tool manifest by name. Raises KeyError if not found."""
+        if tool_name not in self._custom_manifests:
+            raise KeyError(f"custom tool not found: {tool_name}")
+        with self.db.connect() as conn:
+            cur = conn.execute("DELETE FROM custom_tools WHERE name = ?", (tool_name,))
+            if cur.rowcount == 0:
+                raise KeyError(f"custom tool not found in db: {tool_name}")
+        self.reload_custom_tools()
+
     # ------------------------------------------------------------------
     # MCP server management
     # ------------------------------------------------------------------

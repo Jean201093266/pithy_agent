@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
 import re
 import secrets
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import psutil
 import yaml
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.core.agent import (
@@ -46,6 +48,11 @@ from app.schemas import (
     PasswordSetupRequest,
     ReleaseInfoResponse,
     SecurityStatusResponse,
+    SessionCreateRequest,
+    SessionItem,
+    SessionListResponse,
+    SessionRenameRequest,
+    SessionResponse,
     SkillRunRequest,
     SkillImportRequest,
     SkillImportResponse,
@@ -55,6 +62,8 @@ from app.schemas import (
     SkillRollbackRequest,
     SkillRollbackResponse,
     SkillSpec,
+    SkillStatePatch,
+    SkillPackageImportResponse,
     ToolExecutionRequest,
     ToolImportResponse,
     ToolManifestIn,
@@ -133,7 +142,11 @@ def _redact_line(text: str) -> str:
 
 @app.get("/")
 def web_root() -> FileResponse:
-    return FileResponse(ROOT / "app" / "static" / "index.html")
+    resp = FileResponse(ROOT / "app" / "static" / "index.html")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.get("/api/health")
@@ -340,6 +353,17 @@ def import_tool_manifest(payload: ToolManifestIn, request: Request) -> ToolImpor
     )
 
 
+@app.delete("/api/tools/custom/{tool_name}")
+def delete_custom_tool(tool_name: str, request: Request) -> dict[str, Any]:
+    _require_unlocked(request)
+    try:
+        tool_registry.delete_custom_tool(tool_name)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _audit("tool_deleted", f"tool={tool_name}")
+    return {"ok": True, "deleted": tool_name}
+
+
 @app.patch("/api/tools/{tool_name}")
 def patch_tool_state(tool_name: str, payload: ToolStatePatch, request: Request) -> dict[str, Any]:
     _require_unlocked(request)
@@ -444,7 +468,17 @@ def delete_mcp_server(server_id: str, request: Request) -> MCPServerDeleteRespon
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     _require_unlocked(request)
-    session_id = (payload.session_id or "default").strip() or "default"
+    raw_session_id = (payload.session_id or "").strip()
+    session_id = raw_session_id
+    if not session_id:
+        import secrets as _secrets
+        import time as _time
+        session_id = f"session_{int(_time.time() * 1000)}_{_secrets.token_hex(4)}"
+        db.create_session(session_id, "新会话")
+    else:
+        known_sessions = {item["session_id"] for item in db.list_sessions()}
+        if session_id not in known_sessions:
+            db.create_session(session_id, session_id)
     language = detect_language(payload.message)
 
     cfg = config_store.get_model_config()
@@ -479,7 +513,23 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
             memory_update = dict(graph_out.get("memory_update") or {})
 
             plan_exec = build_light_plan_exec(payload.message)
+            # Auto-generate title for the langgraph path too
+            _lg_session_name = ""
+            try:
+                _sg_info = next((s for s in db.list_sessions() if s["session_id"] == session_id), None)
+                if _sg_info:
+                    _cn = _sg_info.get("name", "")
+                    if _cn in {"新会话", session_id, "default", ""} or _cn.startswith("session_"):
+                        _lg_session_name = _generate_session_title(session_id)
+                        if _lg_session_name:
+                            db.rename_session(session_id, _lg_session_name)
+                    else:
+                        _lg_session_name = _cn
+            except Exception as _le:
+                LOGGER.warning("lg auto title failed: %s", _le)
             return ChatResponse(
+                session_id=session_id,
+                session_name=_lg_session_name,
                 language=language,
                 plan=list(plan_exec.get("plan") or []),
                 used_tool=executed_results[-1]["tool"] if executed_results else None,
@@ -628,7 +678,29 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     # Build a lightweight plan_exec dict for response compatibility
     plan_exec = build_light_plan_exec(payload.message)
 
+    # ── Auto-generate session title after first exchange ─────────────────
+    session_name = ""
+    try:
+        session_info = next(
+            (s for s in db.list_sessions() if s["session_id"] == session_id), None
+        )
+        if session_info:
+            current_name = session_info.get("name", "")
+            msg_count = int(session_info.get("message_count", 0))
+            _auto_names = {"新会话", session_id, "default", ""}
+            needs_title = current_name in _auto_names or current_name.startswith("session_")
+            if needs_title and msg_count <= 4:
+                session_name = _generate_session_title(session_id, cfg)
+                if session_name:
+                    db.rename_session(session_id, session_name)
+            else:
+                session_name = current_name
+    except Exception as _e:
+        LOGGER.warning("auto title generation failed: %s", _e)
+
     return ChatResponse(
+        session_id=session_id,
+        session_name=session_name,
         language=language,
         plan=list(plan_exec.get("plan") or []),
         used_tool=executed_results[-1]["tool"] if executed_results else None,
@@ -650,10 +722,101 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     )
 
 
-@app.get("/api/history")
-def history(request: Request) -> list[dict[str, Any]]:
+def _generate_session_title(session_id: str, cfg: "ModelConfig | None" = None) -> str:
+    """Ask LLM to generate a short title (≤ 15 chars) based on the first few messages."""
+    try:
+        messages = db.list_messages(limit=6, session_id=session_id)
+        if not messages:
+            return ""
+        snippet = "\n".join(
+            f"{m['role']}: {m['content'][:120]}" for m in messages[:4]
+        )
+        prompt = (
+            "请根据下面的对话，用5~12个汉字或英文单词生成一个简洁的会话标题，"
+            "只输出标题本身，不要引号、标点、解释或其他内容。\n\n"
+            f"{snippet}"
+        )
+        if cfg is None:
+            cfg = config_store.get_model_config()
+        title = llm_client.call(prompt, cfg, context=None)
+        # Clean up: strip quotes, newlines, leading/trailing spaces
+        title = title.strip().strip("'\"""''「」【】").strip()
+        # Truncate to safe length
+        return title[:20] if title else ""
+    except Exception as exc:
+        LOGGER.warning("_generate_session_title error: %s", exc)
+        return ""
+
+
+@app.post("/api/sessions/{session_id}/generate-title")
+def generate_session_title_api(session_id: str, request: Request) -> dict[str, Any]:
+    """Manually trigger title generation for a session."""
     _require_unlocked(request)
-    return db.list_messages(limit=100)
+    sessions = {s["session_id"] for s in db.list_sessions()}
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    cfg = config_store.get_model_config()
+    title = _generate_session_title(session_id, cfg)
+    if title:
+        db.rename_session(session_id, title)
+    _audit("session_title_generated", f"session_id={session_id} title={title!r}")
+    return {"ok": True, "session_id": session_id, "name": title}
+
+
+
+
+@app.get("/api/history")
+def history(request: Request, session_id: str = Query(default="")) -> list[dict[str, Any]]:
+    _require_unlocked(request)
+    sid = (session_id or "").strip()
+    if not sid:
+        return []
+    return db.list_messages(limit=200, session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Chat session management endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/sessions", response_model=SessionListResponse)
+def list_sessions(request: Request) -> SessionListResponse:
+    _require_unlocked(request)
+    rows = db.list_sessions()
+    return SessionListResponse(sessions=[SessionItem(**r) for r in rows])
+
+
+@app.post("/api/sessions", response_model=SessionResponse)
+def create_session(payload: SessionCreateRequest, request: Request) -> SessionResponse:
+    _require_unlocked(request)
+    import secrets as _secrets
+    import time as _time
+    sid = (payload.session_id or "").strip()
+    if not sid:
+        sid = f"session_{int(_time.time() * 1000)}_{_secrets.token_hex(4)}"
+    name = (payload.name or "").strip() or sid
+    db.create_session(sid, name)
+    _audit("session_create", f"session_id={sid}")
+    return SessionResponse(ok=True, session_id=sid, name=name)
+
+
+@app.patch("/api/sessions/{session_id}", response_model=SessionResponse)
+def rename_session(session_id: str, payload: SessionRenameRequest, request: Request) -> SessionResponse:
+    _require_unlocked(request)
+    ok = db.rename_session(session_id, payload.name)
+    if not ok:
+        raise HTTPException(status_code=404, detail="session not found")
+    _audit("session_rename", f"session_id={session_id} name={payload.name}")
+    return SessionResponse(ok=True, session_id=session_id, name=payload.name)
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str, request: Request) -> dict[str, Any]:
+    _require_unlocked(request)
+    ok = db.delete_session(session_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="session not found")
+    _audit("session_delete", f"session_id={session_id}")
+    return {"ok": True, "session_id": session_id}
 
 
 @app.get("/api/skills")
@@ -798,6 +961,61 @@ def run_skill(skill_id: int, payload: SkillRunRequest, request: Request) -> dict
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/skills/{skill_id}")
+def patch_skill_state(skill_id: int, payload: SkillStatePatch, request: Request) -> dict[str, Any]:
+    _require_unlocked(request)
+    ok = db.set_skill_enabled(skill_id, payload.enabled)
+    if not ok:
+        raise HTTPException(status_code=404, detail="skill not found")
+    _audit("skill_state_updated", f"skill_id={skill_id} enabled={payload.enabled}")
+    return {"ok": True, "skill_id": skill_id, "enabled": payload.enabled}
+
+
+@app.delete("/api/skills/{skill_id}")
+def delete_skill(skill_id: int, request: Request) -> dict[str, Any]:
+    _require_unlocked(request)
+    skill = db.get_skill(skill_id)
+    if skill is None:
+        raise HTTPException(status_code=404, detail="skill not found")
+    ok = db.delete_skill(skill_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="skill not found")
+    _audit("skill_deleted", f"skill_id={skill_id} name={skill['name']}")
+    return {"ok": True, "deleted": skill_id}
+
+
+@app.post("/api/skills/import/package", response_model=SkillPackageImportResponse)
+async def import_skill_package(request: Request, file: UploadFile = File(...)) -> SkillPackageImportResponse:
+    """Import a zip package containing one or more skill JSON/YAML files."""
+    _require_unlocked(request)
+    content = await file.read()
+    imported_skills: list[dict] = []
+    errors: list[str] = []
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            for name in zf.namelist():
+                if not (name.endswith(".json") or name.endswith(".yaml") or name.endswith(".yml")):
+                    continue
+                try:
+                    raw = zf.read(name).decode("utf-8")
+                    fmt = "yaml" if name.endswith((".yaml", ".yml")) else "json"
+                    parsed, _ = _parse_skill_content(raw, fmt)
+                    spec = SkillSpec.model_validate(parsed)
+                    skill_id = db.upsert_skill(spec.name, spec.version, spec.model_dump(), source="package_import")
+                    imported_skills.append({"id": skill_id, "name": spec.name, "version": spec.version, "file": name})
+                except Exception as exc:
+                    errors.append(f"{name}: {exc}")
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail=f"invalid zip file: {exc}") from exc
+
+    if not imported_skills and errors:
+        raise HTTPException(status_code=400, detail="; ".join(errors))
+
+    _audit("skill_package_imported", f"count={len(imported_skills)}")
+    return SkillPackageImportResponse(ok=True, imported=len(imported_skills), skills=imported_skills)
 
 
 @app.get("/api/logs")

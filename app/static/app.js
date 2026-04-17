@@ -8,6 +8,8 @@ const state = {
   latestExportName: 'skill-export',
   visualSteps: [],
   logTimer: null,
+  currentSessionId: localStorage.getItem('pithy.currentSessionId') || 'default',
+  sessions: [],
 };
 
 const I18N = {
@@ -26,6 +28,9 @@ const I18N = {
     noExport: '暂无可复制/下载的导出内容',
     unlockSuccess: '解锁成功',
     passwordSet: '启动密码设置成功',
+    newSession: '新建会话',
+    sessionDeleted: '会话已删除',
+    confirmDeleteSession: '确认删除此会话及所有消息？',
   },
   'en-US': {
     appTitle: 'Pithy Local Agent',
@@ -42,6 +47,9 @@ const I18N = {
     noExport: 'No export content available',
     unlockSuccess: 'Unlocked successfully',
     passwordSet: 'Startup password configured',
+    newSession: 'New Session',
+    sessionDeleted: 'Session deleted',
+    confirmDeleteSession: 'Delete this session and all its messages?',
   },
 };
 
@@ -105,16 +113,83 @@ function applyTranslations() {
   document.getElementById('lock-description').textContent = t('lockDescription');
 }
 
+function renderMarkdown(text) {
+  if (typeof marked !== 'undefined') {
+    try {
+      return marked.parse(text, { breaks: true, gfm: true });
+    } catch (e) { /* fall through */ }
+  }
+  return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g ,'<br>');
+}
+
 function appendLine(role, text) {
-  const div = document.createElement('div');
-  div.innerHTML = `<b>${role}:</b> ${text}`;
-  chatLog.appendChild(div);
+  // Remove empty-state placeholder on first message
+  const empty = chatLog.querySelector('.chat-empty');
+  if (empty) empty.remove();
+
+  const row = document.createElement('div');
+  row.className = `msg-row ${role}`;
+
+  if (role === 'assistant') {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg-content-wrap';
+    const avatar = document.createElement('div');
+    avatar.className = 'msg-avatar';
+    avatar.textContent = 'AI';
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble';
+    bubble.innerHTML = renderMarkdown(text);
+    wrap.appendChild(avatar);
+    wrap.appendChild(bubble);
+    row.appendChild(wrap);
+  } else if (role === 'user') {
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble';
+    bubble.textContent = text;
+    row.appendChild(bubble);
+  } else {
+    // error
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble';
+    bubble.textContent = text;
+    row.appendChild(bubble);
+  }
+
+  chatLog.appendChild(row);
   chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+// ── Toast notifications ──────────────────────────────────────────────────
+function showToast(message, type = 'info', duration = 3000) {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.textContent = message;
+  container.appendChild(toast);
+  setTimeout(() => {
+    toast.classList.add('out');
+    setTimeout(() => toast.remove(), 220);
+  }, duration);
 }
 
 function showError(message) {
   appendLine('error', message);
   chatDebug.textContent = message;
+}
+
+// ── Tab switching ────────────────────────────────────────────────────────
+function initTabs() {
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tab = btn.dataset.tab;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      const pane = document.getElementById(`tab-${tab}`);
+      if (pane) pane.classList.add('active');
+    });
+  });
 }
 
 function setSkillResult(value) {
@@ -209,9 +284,168 @@ async function refreshHealth() {
 }
 
 async function refreshHistory() {
-  const history = await api('/api/history');
+  if (!state.currentSessionId) {
+    chatLog.innerHTML = '';
+    return;
+  }
+  const history = await api(`/api/history?session_id=${encodeURIComponent(state.currentSessionId)}`);
   chatLog.innerHTML = '';
   history.forEach(item => appendLine(item.role, item.content));
+}
+
+// ── Session management ──────────────────────────────────────────────────────
+
+function renderSessionList() {
+  const listEl = document.getElementById('session-list');
+  if (!listEl) return;
+  listEl.innerHTML = '';
+  state.sessions.forEach(s => {
+    const li = document.createElement('li');
+    li.className = 'session-item' + (s.session_id === state.currentSessionId ? ' active' : '');
+    li.dataset.sessionId = s.session_id;
+
+    // Session icon
+    const icon = document.createElement('div');
+    icon.className = 'session-icon';
+    icon.textContent = '💬';
+    li.appendChild(icon);
+
+    // Session info block
+    const infoDiv = document.createElement('div');
+    infoDiv.className = 'session-info';
+    infoDiv.onclick = () => switchSession(s.session_id);
+
+    // Session name (click to switch)
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'session-name';
+    nameSpan.textContent = s.name || s.session_id;
+    const metaSpan = document.createElement('span');
+    metaSpan.className = 'session-meta';
+    metaSpan.textContent = `${s.message_count} 条消息`;
+    infoDiv.appendChild(nameSpan);
+    infoDiv.appendChild(metaSpan);
+    li.appendChild(infoDiv);
+
+    // Action buttons group
+    const actions = document.createElement('div');
+    actions.className = 'session-actions';
+
+    // Rename button
+    const renameBtn = document.createElement('button');
+    renameBtn.className = 'session-action-btn';
+    renameBtn.textContent = '✏';
+    renameBtn.title = '重命名';
+    renameBtn.onclick = async (e) => {
+      e.stopPropagation();
+      const newName = prompt('重命名会话', s.name || s.session_id);
+      if (!newName || !newName.trim() || newName.trim() === s.name) return;
+      await api(`/api/sessions/${encodeURIComponent(s.session_id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name: newName.trim() }),
+      });
+      s.name = newName.trim();
+      nameSpan.textContent = s.name;
+      if (s.session_id === state.currentSessionId) updateCurrentSessionLabel();
+    };
+    actions.appendChild(renameBtn);
+
+    // Auto-title button
+    const titleBtn = document.createElement('button');
+    titleBtn.className = 'session-action-btn';
+    titleBtn.textContent = '✨';
+    titleBtn.title = 'AI 生成标题';
+    titleBtn.onclick = async (e) => {
+      e.stopPropagation();
+      titleBtn.textContent = '…';
+      titleBtn.disabled = true;
+      try {
+        const res = await api(`/api/sessions/${encodeURIComponent(s.session_id)}/generate-title`, { method: 'POST' });
+        if (res.name) {
+          s.name = res.name;
+          nameSpan.textContent = res.name;
+          if (s.session_id === state.currentSessionId) updateCurrentSessionLabel();
+        }
+      } catch (err) {
+        console.warn('generate title failed', err);
+      } finally {
+        titleBtn.textContent = '✨';
+        titleBtn.disabled = false;
+      }
+    };
+    actions.appendChild(titleBtn);
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'session-action-btn session-del-btn';
+    delBtn.textContent = '🗑';
+    delBtn.title = '删除会话';
+    delBtn.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`删除「${s.name || s.session_id}」及其全部消息？此操作不可撤销。`)) return;
+      await api(`/api/sessions/${encodeURIComponent(s.session_id)}`, { method: 'DELETE' });
+      const deletedCurrent = state.currentSessionId === s.session_id;
+      await loadSessions();
+      if (deletedCurrent) {
+        const nextSessionId = (state.sessions[0] && state.sessions[0].session_id) || '';
+        await switchSession(nextSessionId);
+      }
+    };
+    actions.appendChild(delBtn);
+
+    li.appendChild(actions);
+    listEl.appendChild(li);
+  });
+}
+
+
+function updateCurrentSessionLabel() {
+  const labelEl = document.getElementById('current-session-label');
+  if (!labelEl) return;
+  const s = state.sessions.find(x => x.session_id === state.currentSessionId);
+  const name = s ? (s.name || s.session_id) : (state.currentSessionId || '');
+  if (name) {
+    labelEl.textContent = name;
+    labelEl.classList.remove('hidden');
+  } else {
+    labelEl.textContent = '';
+    labelEl.classList.add('hidden');
+  }
+}
+
+async function switchSession(sessionId) {
+  state.currentSessionId = sessionId || '';
+  if (state.currentSessionId) {
+    localStorage.setItem('pithy.currentSessionId', state.currentSessionId);
+  } else {
+    localStorage.removeItem('pithy.currentSessionId');
+  }
+  updateCurrentSessionLabel();
+  renderSessionList();
+  chatLog.innerHTML = '';
+  chatDebug.textContent = '';
+  await refreshHistory();
+}
+
+async function loadSessions() {
+  const data = await api('/api/sessions');
+  state.sessions = data.sessions || [];
+  // If current session no longer exists in list, clear current selection
+  if (!state.sessions.find(s => s.session_id === state.currentSessionId)) {
+    state.currentSessionId = '';
+    localStorage.removeItem('pithy.currentSessionId');
+  }
+  renderSessionList();
+  updateCurrentSessionLabel();
+}
+
+async function createNewSession() {
+  const name = prompt(t('newSession') + '（输入名称，留空自动生成）', '');
+  if (name === null) return; // cancelled
+  const res = await api('/api/sessions', {
+    method: 'POST',
+    body: JSON.stringify({ name: name.trim() }),
+  });
+  await loadSessions();
+  await switchSession(res.session_id);
 }
 
 async function loadConfig() {
@@ -232,11 +466,46 @@ async function loadTools() {
   tools.forEach(tool => {
     const row = document.createElement('div');
     row.className = 'row';
-    row.innerHTML = `<span>${tool.name} (${tool.risk_level})</span><button>${tool.enabled ? '禁用' : '启用'}</button>`;
-    row.querySelector('button').onclick = async () => {
+
+    const info = document.createElement('span');
+    const badge = tool.source === 'custom'
+      ? `<span style="font-size:10px;padding:1px 6px;border-radius:999px;background:var(--accent-t);color:var(--accent);border:1px solid var(--accent-b);margin-left:5px;font-weight:700">自定义</span>`
+      : '';
+    info.innerHTML = `${tool.name} <span style="color:var(--text-3);font-size:11px">(${tool.risk_level})</span>${badge}`;
+
+    const btns = document.createElement('div');
+    btns.style.cssText = 'display:flex;gap:6px';
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'btn btn-ghost btn-sm';
+    toggleBtn.textContent = tool.enabled ? '禁用' : '启用';
+    toggleBtn.onclick = async () => {
       await api(`/api/tools/${tool.name}`, { method: 'PATCH', body: JSON.stringify({ enabled: !tool.enabled }) });
       await loadTools();
     };
+    btns.appendChild(toggleBtn);
+
+    if (tool.source === 'custom') {
+      const delBtn = document.createElement('button');
+      delBtn.className = 'btn btn-danger btn-sm';
+      delBtn.textContent = '删除';
+      delBtn.onclick = async () => {
+        if (!confirm(`确认删除自定义工具「${tool.name}」？此操作不可撤销。`)) return;
+        try {
+          await api(`/api/tools/custom/${encodeURIComponent(tool.name)}`, { method: 'DELETE' });
+          showToast(`工具「${tool.name}」已删除`, 'success');
+          await loadTools();
+          await loadToolManifests();
+        } catch (e) {
+          showToast(e.message, 'error');
+          setSkillResult(e.message);
+        }
+      };
+      btns.appendChild(delBtn);
+    }
+
+    row.appendChild(info);
+    row.appendChild(btns);
     box.appendChild(row);
   });
 }
@@ -259,6 +528,109 @@ async function getLatestSkill() {
   if (!skills.length) throw new Error(t('noSkill'));
   state.latestSkill = skills[0];
   return state.latestSkill;
+}
+
+async function loadSkillList() {
+  const skills = await api('/api/skills');
+  const box = document.getElementById('skill-list');
+  if (!box) return;
+  box.innerHTML = '';
+
+  if (!skills.length) {
+    box.innerHTML = `<div style="padding:16px;text-align:center;color:var(--text-3);font-size:13px">暂无技能，请先导入或创建</div>`;
+    return;
+  }
+
+  skills.forEach(skill => {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.style.cssText = 'flex-direction:column;align-items:stretch;gap:6px;padding:10px 12px';
+
+    // Top row: name + badges + buttons
+    const topRow = document.createElement('div');
+    topRow.style.cssText = 'display:flex;align-items:center;gap:8px';
+
+    const nameSpan = document.createElement('span');
+    nameSpan.style.cssText = 'font-weight:700;font-size:13px;color:var(--text-1);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    nameSpan.textContent = skill.name;
+
+    const versionBadge = document.createElement('span');
+    versionBadge.style.cssText = 'font-size:10px;padding:1px 6px;border-radius:999px;background:var(--surface-3);color:var(--text-3);border:1px solid var(--border);white-space:nowrap;flex-shrink:0';
+    versionBadge.textContent = `v${skill.version}`;
+
+    const enabledBadge = document.createElement('span');
+    enabledBadge.style.cssText = `font-size:10px;padding:1px 6px;border-radius:999px;flex-shrink:0;white-space:nowrap;${skill.enabled
+      ? 'background:rgba(24,160,88,.1);color:#18a058;border:1px solid rgba(24,160,88,.25)'
+      : 'background:var(--surface-3);color:var(--text-3);border:1px solid var(--border)'}`;
+    enabledBadge.textContent = skill.enabled ? '已启用' : '已禁用';
+
+    const btns = document.createElement('div');
+    btns.style.cssText = 'display:flex;gap:4px;flex-shrink:0';
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'btn btn-ghost btn-sm';
+    toggleBtn.textContent = skill.enabled ? '禁用' : '启用';
+    toggleBtn.onclick = async () => {
+      try {
+        await api(`/api/skills/${skill.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !skill.enabled }) });
+        showToast(`技能「${skill.name}」已${skill.enabled ? '禁用' : '启用'}`, 'success');
+        await loadSkillList();
+      } catch (e) { showToast(e.message, 'error'); }
+    };
+
+    const runBtn = document.createElement('button');
+    runBtn.className = 'btn btn-ghost btn-sm';
+    runBtn.textContent = '▶ 运行';
+    runBtn.onclick = async () => {
+      try {
+        const res = await api(`/api/skills/${skill.id}/run`, {
+          method: 'POST',
+          body: JSON.stringify({ input_text: '执行技能', context: {} }),
+        });
+        setSkillResult(res);
+        showToast('技能运行完成', 'success');
+      } catch (e) { setSkillResult(e.message); showToast(e.message, 'error'); }
+    };
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn btn-danger btn-sm';
+    delBtn.textContent = '删除';
+    delBtn.onclick = async () => {
+      if (!confirm(`确认删除技能「${skill.name}」及其所有版本？此操作不可撤销。`)) return;
+      try {
+        await api(`/api/skills/${skill.id}`, { method: 'DELETE' });
+        showToast(`技能「${skill.name}」已删除`, 'success');
+        state.latestSkill = null;
+        await loadSkillList();
+      } catch (e) { showToast(e.message, 'error'); }
+    };
+
+    btns.appendChild(toggleBtn);
+    btns.appendChild(runBtn);
+    btns.appendChild(delBtn);
+    topRow.appendChild(nameSpan);
+    topRow.appendChild(versionBadge);
+    topRow.appendChild(enabledBadge);
+    topRow.appendChild(btns);
+
+    row.appendChild(topRow);
+
+    // Description row
+    if (skill.description) {
+      const desc = document.createElement('div');
+      desc.style.cssText = 'font-size:12px;color:var(--text-3);line-height:1.5';
+      desc.textContent = skill.description;
+      row.appendChild(desc);
+    }
+
+    // Meta row
+    const meta = document.createElement('div');
+    meta.style.cssText = 'font-size:11px;color:var(--text-4)';
+    meta.textContent = `ID: ${skill.id} · 创建于 ${skill.created_at || ''}`;
+    row.appendChild(meta);
+
+    box.appendChild(row);
+  });
 }
 
 async function loadSkillVersions() {
@@ -334,6 +706,8 @@ function scheduleLogRefresh() {
 }
 
 async function loadProtectedData() {
+  // Sessions first (non-blocking: failures must not prevent history/config from loading)
+  try { await loadSessions(); } catch (e) { console.warn('loadSessions failed:', e.message); }
   await refreshHistory();
   await loadConfig();
   await refreshReleaseInfo();
@@ -342,6 +716,7 @@ async function loadProtectedData() {
   await loadToolManifests();
   try {
     state.latestSkill = null;
+    await loadSkillList();
     await loadSkillVersions();
   } catch (e) {
     skillVersionsEl.textContent = String(e.message || e);
@@ -355,9 +730,31 @@ document.getElementById('send-btn').onclick = async () => {
   appendLine('user', msg);
   document.getElementById('chat-input').value = '';
   try {
-    const res = await api('/api/chat', { method: 'POST', body: JSON.stringify({ message: msg }) });
+    const res = await api('/api/chat', {
+      method: 'POST',
+      body: JSON.stringify({ message: msg, session_id: state.currentSessionId }),
+    });
+    const actualSessionId = res.session_id || state.currentSessionId || '';
+    const sessionChanged = actualSessionId !== state.currentSessionId;
+    state.currentSessionId = actualSessionId;
+    if (state.currentSessionId) {
+      localStorage.setItem('pithy.currentSessionId', state.currentSessionId);
+    }
     appendLine('assistant', res.reply);
     chatDebug.textContent = JSON.stringify(res.brain || res, null, 2);
+
+    // Sync title if backend generated one
+    if (res.session_name) {
+      const existing = state.sessions.find(s => s.session_id === actualSessionId);
+      if (existing) existing.name = res.session_name;
+    }
+
+    await loadSessions().catch(() => {});
+    if (sessionChanged) {
+      await switchSession(actualSessionId);
+    } else {
+      updateCurrentSessionLabel();
+    }
   } catch (e) {
     appendLine('error', e.message);
   }
@@ -585,6 +982,8 @@ document.getElementById('run-latest-skill').onclick = async () => {
   }
 };
 
+document.getElementById('refresh-skill-list').onclick = () => loadSkillList().catch(e => showToast(e.message, 'error'));
+
 document.getElementById('import-skill').onclick = async () => {
   try {
     state.latestSkill = null;
@@ -594,11 +993,42 @@ document.getElementById('import-skill').onclick = async () => {
     };
     const res = await api('/api/skills/import', { method: 'POST', body: JSON.stringify(payload) });
     setSkillResult(res);
-    await loadSkillVersions();
+    showToast(`技能「${res.name}」导入成功`, 'success');
+    await loadSkillList();
+    await loadSkillVersions().catch(() => {});
   } catch (e) {
     setSkillResult(e.message);
+    showToast(e.message, 'error');
   }
 };
+
+// Skill package (zip) import
+document.getElementById('skill-package-file').addEventListener('change', async (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  document.getElementById('skill-package-label').textContent = file.name;
+  const resultEl = document.getElementById('skill-import-result');
+  resultEl.classList.remove('hidden');
+  resultEl.textContent = '正在导入…';
+  try {
+    const formData = new FormData();
+    formData.append('file', file);
+    const headers = {};
+    if (state.sessionToken) headers['X-Session-Token'] = state.sessionToken;
+    const resp = await fetch('/api/skills/import/package', { method: 'POST', headers, body: formData });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || JSON.stringify(data));
+    resultEl.textContent = JSON.stringify(data, null, 2);
+    showToast(`技能包导入完成，共 ${data.imported} 个技能`, 'success');
+    state.latestSkill = null;
+    await loadSkillList();
+  } catch (err) {
+    resultEl.textContent = err.message;
+    showToast(err.message, 'error');
+  }
+  // reset so same file can be re-selected
+  e.target.value = '';
+});
 
 document.getElementById('load-skill-versions').onclick = async () => {
   try {
@@ -654,6 +1084,8 @@ document.getElementById('download-export-content').onclick = () => {
 document.getElementById('refresh-logs').onclick = () => refreshLogs().catch(e => setSkillResult(e.message));
 document.getElementById('refresh-release-info').onclick = () => refreshReleaseInfo().catch(e => setSkillResult(e.message));
 
+document.getElementById('new-session-btn').onclick = () => createNewSession().catch(e => showError(e.message));
+
 document.getElementById('lock-app').onclick = async () => {
   try {
     await api('/api/security/lock', { method: 'POST' });
@@ -708,6 +1140,7 @@ document.getElementById('pref-theme').addEventListener('change', () => {
 
 (async () => {
   try {
+    initTabs();
     await refreshSecurityStatus();
     await loadAppSettings();
     updateLockUI();

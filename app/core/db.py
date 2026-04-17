@@ -70,6 +70,12 @@ class AppDB:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS conversation_summaries (
                     session_id TEXT PRIMARY KEY,
                     summary TEXT NOT NULL,
@@ -102,6 +108,11 @@ class AppDB:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conversations_session_id ON conversations(session_id, id DESC)"
             )
+            skill_cols = {row["name"] for row in conn.execute("PRAGMA table_info(skills)").fetchall()}
+            if "enabled" not in skill_cols:
+                conn.execute("ALTER TABLE skills ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+            if "description" not in skill_cols:
+                conn.execute("ALTER TABLE skills ADD COLUMN description TEXT NOT NULL DEFAULT ''")
 
     def get_kv(self, key: str) -> str | None:
         with self.connect() as conn:
@@ -117,10 +128,20 @@ class AppDB:
             )
 
     def add_message(self, role: str, content: str, session_id: str = "default") -> None:
+        sid = session_id or "default"
         with self.connect() as conn:
+            # Auto-create session row if missing
+            conn.execute(
+                "INSERT INTO chat_sessions(session_id, name) VALUES(?, ?) ON CONFLICT(session_id) DO NOTHING",
+                (sid, sid),
+            )
             conn.execute(
                 "INSERT INTO conversations(session_id, role, content) VALUES(?, ?, ?)",
-                (session_id or "default", role, content),
+                (sid, role, content),
+            )
+            conn.execute(
+                "UPDATE chat_sessions SET updated_at=CURRENT_TIMESTAMP WHERE session_id=?",
+                (sid,),
             )
 
     def list_messages(self, limit: int = 30, session_id: str = "default") -> list[dict[str, Any]]:
@@ -390,7 +411,7 @@ class AppDB:
     def list_skills(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT id, name, version, spec_json, created_at FROM skills ORDER BY id DESC"
+                "SELECT id, name, version, spec_json, created_at, enabled FROM skills ORDER BY id DESC"
             ).fetchall()
         return [
             {
@@ -399,6 +420,8 @@ class AppDB:
                 "version": row["version"],
                 "spec": json.loads(row["spec_json"]),
                 "created_at": row["created_at"],
+                "enabled": bool(row["enabled"]) if row["enabled"] is not None else True,
+                "description": json.loads(row["spec_json"]).get("description", ""),
             }
             for row in rows
         ]
@@ -406,16 +429,33 @@ class AppDB:
     def get_skill(self, skill_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT id, name, version, spec_json FROM skills WHERE id = ?", (skill_id,)
+                "SELECT id, name, version, spec_json, enabled FROM skills WHERE id = ?", (skill_id,)
             ).fetchone()
         if row is None:
             return None
+        spec = json.loads(row["spec_json"])
         return {
             "id": row["id"],
             "name": row["name"],
             "version": row["version"],
-            "spec": json.loads(row["spec_json"]),
+            "spec": spec,
+            "enabled": bool(row["enabled"]) if row["enabled"] is not None else True,
+            "description": spec.get("description", ""),
         }
+
+    def set_skill_enabled(self, skill_id: int, enabled: bool) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE skills SET enabled = ? WHERE id = ?",
+                (int(enabled), skill_id),
+            )
+        return cur.rowcount > 0
+
+    def delete_skill(self, skill_id: int) -> bool:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM skill_versions WHERE skill_id = ?", (skill_id,))
+            cur = conn.execute("DELETE FROM skills WHERE id = ?", (skill_id,))
+        return cur.rowcount > 0
 
     def upsert_custom_tool(self, name: str, manifest: dict[str, Any]) -> int:
         serialized = json.dumps(manifest, ensure_ascii=False)
@@ -514,4 +554,81 @@ class AppDB:
             "enabled": bool(row["enabled"]),
             "created_at": row["created_at"],
         }
+
+    # ------------------------------------------------------------------
+    # Chat session management
+    # ------------------------------------------------------------------
+
+    def ensure_session(self, session_id: str, name: str = "") -> None:
+        """Create session record if it does not yet exist."""
+        sid = session_id or "default"
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO chat_sessions(session_id, name) VALUES(?, ?) ON CONFLICT(session_id) DO NOTHING",
+                (sid, name or sid),
+            )
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        """Return all sessions with message count, ordered by most-recently updated."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT s.session_id, s.name, s.created_at, s.updated_at,
+                       COUNT(c.id) AS message_count
+                FROM chat_sessions s
+                LEFT JOIN conversations c ON c.session_id = s.session_id
+                GROUP BY s.session_id
+                ORDER BY s.updated_at DESC, s.created_at DESC
+                """
+            ).fetchall()
+        return [
+            {
+                "session_id": row["session_id"],
+                "name": row["name"],
+                "message_count": int(row["message_count"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def create_session(self, session_id: str, name: str = "") -> str:
+        """Create a brand-new session and return its session_id."""
+        sid = (session_id or "").strip()
+        if not sid:
+            raise ValueError("session_id is required")
+        effective_name = (name or "").strip() or sid
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO chat_sessions(session_id, name) VALUES(?, ?)"
+                " ON CONFLICT(session_id) DO UPDATE SET name=excluded.name, updated_at=CURRENT_TIMESTAMP",
+                (sid, effective_name),
+            )
+        return sid
+
+    def rename_session(self, session_id: str, name: str) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE chat_sessions SET name=?, updated_at=CURRENT_TIMESTAMP WHERE session_id=?",
+                (name.strip(), session_id),
+            )
+        return cur.rowcount > 0
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete session and all associated data."""
+        with self.connect() as conn:
+            conn.execute("DELETE FROM conversations WHERE session_id=?", (session_id,))
+            conn.execute("DELETE FROM conversation_summaries WHERE session_id=?", (session_id,))
+            conn.execute("DELETE FROM conversation_state WHERE session_id=?", (session_id,))
+            conn.execute("DELETE FROM memory_items WHERE session_id=?", (session_id,))
+            cur = conn.execute("DELETE FROM chat_sessions WHERE session_id=?", (session_id,))
+        return cur.rowcount > 0
+
+    def touch_session(self, session_id: str) -> None:
+        """Update the updated_at timestamp when a new message is added."""
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE chat_sessions SET updated_at=CURRENT_TIMESTAMP WHERE session_id=?",
+                (session_id,),
+            )
 
