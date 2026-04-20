@@ -275,11 +275,13 @@ class PlannerExecutorEngine:
                 user_message=message,
             )
             try:
-                raw, _ = llm.call_with_usage(
+                raw, usage = llm.call_with_usage(
                     planner_prompt, cfg, context=None,
                     json_mode=True,  # structured output
                     system_prompt="You are a task planner. Always respond with valid JSON only.",
                 )
+                state["total_prompt_tokens"] = state.get("total_prompt_tokens", 0) + usage.prompt_tokens
+                state["total_completion_tokens"] = state.get("total_completion_tokens", 0) + usage.completion_tokens
                 plan_data = _parse_plan(str(raw))
             except Exception as exc:
                 LOGGER.warning("Planner LLM failed: %s – using single-step fallback", exc)
@@ -298,6 +300,8 @@ class PlannerExecutorEngine:
         state["step_outputs"]   = []
         state["react_trace"]    = []
         state["executed_results"] = []
+        state["total_prompt_tokens"] = state.get("total_prompt_tokens", 0)
+        state["total_completion_tokens"] = state.get("total_completion_tokens", 0)
         LOGGER.info("Plan generated: %d steps – %s", len(steps), plan_data.get("reasoning", "")[:100])
         return state
 
@@ -383,10 +387,13 @@ class PlannerExecutorEngine:
                         + f"Current task: {task}"
                     )
                     try:
-                        output = str(llm.call_with_usage(
+                        raw_out, usage = llm.call_with_usage(
                             step_prompt, cfg, context=None,
                             system_prompt=state.get("system_prompt"),
-                        )[0])
+                        )
+                        output = str(raw_out)
+                        state["total_prompt_tokens"] = state.get("total_prompt_tokens", 0) + usage.prompt_tokens
+                        state["total_completion_tokens"] = state.get("total_completion_tokens", 0) + usage.completion_tokens
                     except LLMProviderError:
                         raise
                     except Exception as exc:
@@ -433,10 +440,13 @@ class PlannerExecutorEngine:
                 )
                 llm = self.adapter.llm_client
                 try:
-                    final = str(llm.call_with_usage(
+                    raw_final, usage = llm.call_with_usage(
                         synth_prompt, cfg, context=None,
                         system_prompt=state.get("system_prompt"),
-                    )[0])
+                    )
+                    final = str(raw_final)
+                    state["total_prompt_tokens"] = state.get("total_prompt_tokens", 0) + usage.prompt_tokens
+                    state["total_completion_tokens"] = state.get("total_completion_tokens", 0) + usage.completion_tokens
                 except LLMProviderError:
                     raise
                 except Exception as exc:
@@ -444,6 +454,8 @@ class PlannerExecutorEngine:
                     LOGGER.warning("Synthesize LLM failed: %s – using raw outputs", exc)
 
         state["final_reply"] = final
+        state["total_prompt_tokens"] = state.get("total_prompt_tokens", 0)
+        state["total_completion_tokens"] = state.get("total_completion_tokens", 0)
         return state
 
     def _node_update(self, state: dict[str, Any]) -> dict[str, Any]:

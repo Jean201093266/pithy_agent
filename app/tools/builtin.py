@@ -329,11 +329,23 @@ def tool_http_request(params: dict[str, Any]) -> dict[str, Any]:
         data=body if isinstance(body, str) else None,
         timeout=timeout,
         allow_redirects=True,
+        stream=True,
     )
+    # Limit response body size to 5MB to prevent memory exhaustion
+    max_body = 5 * 1024 * 1024
+    content_length = int(resp.headers.get("content-length", 0))
+    if content_length > max_body:
+        resp.close()
+        return {
+            "url": url, "method": method, "status_code": resp.status_code,
+            "headers": dict(resp.headers),
+            "body": f"[response too large: {content_length} bytes, max {max_body}]",
+        }
+    raw_body = resp.content[:max_body]
     try:
-        response_body = resp.json()
+        response_body = json.loads(raw_body)
     except Exception:
-        response_body = resp.text[:10000]
+        response_body = raw_body.decode("utf-8", errors="replace")[:10000]
 
     return {
         "url": url,
