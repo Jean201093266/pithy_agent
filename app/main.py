@@ -18,10 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.agent import (
     build_light_plan_exec,
-    build_react_scratchpad,
-    build_react_system_prompt,
     detect_language,
-    parse_react_llm_output,
 )
 from app.core.config_store import AppSettings, ConfigStore, ModelConfig
 from app.core.db import AppDB
@@ -29,7 +26,6 @@ from app.core.langchain_adapter import LangChainAdapter
 from app.core.llm import LLMClient
 from app.core.llm_errors import LLMProviderError
 from app.core.chat_graph import ChatGraphEngine
-from app.core.memory import MemoryManager
 from app.core.memory_enhanced import EnhancedMemoryManager, EnhancedMemoryConfig
 from app.core.chat_graph_planner import PlannerExecutorEngine
 from app.core.input_guard import InputGuard
@@ -299,90 +295,6 @@ def _ensure_session(session_id: str | None) -> str:
         if not db.session_exists(sid):
             db.create_session(sid, sid)
     return sid
-
-
-def _resolve_tool_params(
-    params: dict[str, Any],
-    executed_results: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Resolve {{tool:xxx}} template references in params."""
-    resolved: dict[str, Any] = {}
-    for key, value in params.items():
-        if isinstance(value, str) and value.startswith("{{tool:") and value.endswith("}}"):
-            ref_name = value[7:-2]
-            ref = next((item for item in reversed(executed_results) if item["tool"] == ref_name), None)
-            resolved[key] = json.dumps(ref["result"], ensure_ascii=False) if ref else ""
-        else:
-            resolved[key] = value
-    return resolved
-
-
-def _run_react_loop(
-    message: str,
-    cfg: Any,
-    enabled_tools: list[dict[str, Any]],
-    memory_prompt: str,
-    react_trace: list[dict[str, Any]],
-    executed_results: list[dict[str, Any]],
-    system_prompt_override: str | None = None,
-) -> tuple[str, int, int]:
-    """Execute the ReAct reasoning loop. Returns (final_reply, prompt_tokens, completion_tokens)."""
-    MAX_STEPS = 6
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-    final_reply = ""
-    available_tool_names: set[str] = {t["name"] for t in enabled_tools}
-    system_prompt = build_react_system_prompt(enabled_tools)
-
-    for _step in range(MAX_STEPS):
-        question = message if not memory_prompt else f"{message}\n\n[Memory Context]\n{memory_prompt}"
-        scratchpad = build_react_scratchpad(question, react_trace)
-        ctx = [{"role": "system", "content": system_prompt}]
-        kwargs: dict[str, Any] = {}
-        if system_prompt_override:
-            kwargs["system_prompt"] = system_prompt_override
-        raw_output, usage = llm_client.call_with_usage(scratchpad, cfg, context=ctx, **kwargs)
-        total_prompt_tokens += usage.prompt_tokens
-        total_completion_tokens += usage.completion_tokens
-
-        decision = parse_react_llm_output(raw_output, available_tool_names)
-
-        if decision.should_stop or decision.action is None:
-            final_reply = decision.final_answer or raw_output
-            react_trace.append({
-                "thought": decision.thought,
-                "action": None,
-                "observation": {"stop_reason": decision.stop_reason or "final_answer"},
-            })
-            break
-
-        call = decision.action
-        resolved_params = _resolve_tool_params(call.params, executed_results)
-
-        try:
-            result = tool_registry.execute(call.name, resolved_params, authorized=True)
-        except Exception as exc:
-            result = {"error": str(exc)}
-
-        executed_results.append({
-            "tool": call.name,
-            "params": resolved_params,
-            "reason": call.reason,
-            "result": result,
-        })
-        react_trace.append({
-            "thought": decision.thought,
-            "action": {"tool": call.name, "params": resolved_params},
-            "observation": result,
-        })
-    else:
-        react_trace.append({
-            "thought": "Max steps reached.",
-            "action": None,
-            "observation": {"stop_reason": "max_steps_reached"},
-        })
-
-    return final_reply, total_prompt_tokens, total_completion_tokens
 
 
 def _auto_title_session(session_id: str, cfg: Any = None) -> str:
@@ -822,145 +734,27 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     executed_results: list[dict[str, Any]] = []
     last_result: Any | None = None
     final_reply: str = ""
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
 
-    use_langgraph = chat_graph_engine.available
-    if use_langgraph:
-        try:
-            graph_out = chat_graph_engine.run(
-                message=payload.message,
-                cfg=cfg,
-                session_id=session_id,
-                force_tool=payload.force_tool,
-                tool_params=payload.tool_params,
-                enabled_tools=enabled_tools,
-                is_mock=is_mock,
-            )
-            react_trace = list(graph_out.get("react_trace") or [])
-            executed_results = list(graph_out.get("executed_results") or [])
-            last_result = graph_out.get("last_result")
-            final_reply = str(graph_out.get("final_reply") or "")
-            memory_update = dict(graph_out.get("memory_update") or {})
+    try:
+        graph_out = chat_graph_engine.run(
+            message=payload.message,
+            cfg=cfg,
+            session_id=session_id,
+            force_tool=payload.force_tool,
+            tool_params=payload.tool_params,
+            enabled_tools=enabled_tools,
+            is_mock=is_mock,
+        )
+        react_trace = list(graph_out.get("react_trace") or [])
+        executed_results = list(graph_out.get("executed_results") or [])
+        last_result = graph_out.get("last_result")
+        final_reply = str(graph_out.get("final_reply") or "")
+        memory_update = dict(graph_out.get("memory_update") or {})
+    except LLMProviderError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
 
-            plan_exec = build_light_plan_exec(payload.message)
-            _lg_session_name = _auto_title_session(session_id, cfg)
-            return ChatResponse(
-                session_id=session_id,
-                session_name=_lg_session_name,
-                language=language,
-                plan=list(plan_exec.get("plan") or []),
-                used_tool=executed_results[-1]["tool"] if executed_results else None,
-                tool_result=last_result,
-                reply=final_reply,
-                brain={
-                    **plan_exec,
-                    "strategy": "langgraph-react",
-                    "react_trace": react_trace,
-                    "executed_tools": executed_results,
-                    "memory": {
-                        "session_id": session_id,
-                        "short_term_messages": len(((graph_out.get("memory_ctx") or {}).get("short_term") or {}).get("messages") or []),
-                        "retrieved_long_term": len((graph_out.get("memory_ctx") or {}).get("long_term") or []),
-                        "summary": memory_update.get("summary") or "",
-                        "state": memory_update.get("state") or {},
-                    },
-                },
-            )
-        except LLMProviderError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
-        except Exception:
-            APP_LOGGER.exception("LangGraph chat path failed, falling back to legacy flow.")
-
-    db.add_message("user", payload.message, session_id=session_id)
-    memory_ctx = memory_manager.retrieve_context(payload.message, session_id=session_id)
-    memory_prompt = str(memory_ctx.get("memory_prompt") or "").strip()
-
-
-    # ------------------------------------------------------------------ #
-    # If a force_tool is specified, honour it immediately (first step)     #
-    # ------------------------------------------------------------------ #
-    if payload.force_tool:
-        call_params = {k: str(v) for k, v in (payload.tool_params or {}).items()}
-        try:
-            result = tool_registry.execute(payload.force_tool, call_params, authorized=True)
-        except Exception as exc:
-            result = {"error": str(exc)}
-        executed_results.append({
-            "tool": payload.force_tool,
-            "params": call_params,
-            "reason": "force_tool",
-            "result": result,
-        })
-        react_trace.append({
-            "thought": f"User explicitly requested tool: {payload.force_tool}",
-            "action": {"tool": payload.force_tool, "params": call_params},
-            "observation": result,
-        })
-        last_result = result
-
-    # ------------------------------------------------------------------ #
-    # LLM-driven ReAct loop (skipped for mock provider to stay predictable)
-    # ------------------------------------------------------------------ #
-    if not is_mock:
-        try:
-            final_reply, total_prompt_tokens, total_completion_tokens = _run_react_loop(
-                message=payload.message,
-                cfg=cfg,
-                enabled_tools=enabled_tools,
-                memory_prompt=memory_prompt,
-                react_trace=react_trace,
-                executed_results=executed_results,
-            )
-            last_result = executed_results[-1]["result"] if executed_results else last_result
-        except LLMProviderError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
-
-    # ------------------------------------------------------------------ #
-    # Final LLM call: summarise with full context (or first call for mock) #
-    # ------------------------------------------------------------------ #
-    if not final_reply:
-        if executed_results:
-            summary_prompt = (
-                f"用户输入: {payload.message}\n"
-                f"记忆上下文: {memory_prompt or '无'}\n"
-                f"ReAct轨迹: {json.dumps(react_trace, ensure_ascii=False)}\n"
-                f"工具执行结果: {json.dumps(executed_results, ensure_ascii=False)}\n"
-                f"请根据以上信息给出最终回答。"
-            )
-        else:
-            summary_prompt = payload.message if not memory_prompt else f"{payload.message}\n\n参考记忆:\n{memory_prompt}"
-        try:
-            context_messages = memory_ctx.get("context_messages") or db.list_messages(limit=20, session_id=session_id)
-            final_reply = llm_client.call(summary_prompt, cfg, context_messages)
-        except LLMProviderError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
-
-    db.add_message("assistant", final_reply, session_id=session_id)
     # Sanitize output to prevent XSS
     final_reply = InputGuard.sanitize_output(final_reply)
-    memory_update = memory_manager.update_after_turn(
-        user_message=payload.message,
-        assistant_reply=final_reply,
-        session_id=session_id,
-        tool_trace=executed_results,
-    )
-
-    # Record token usage for non-streaming path
-    if total_prompt_tokens or total_completion_tokens:
-        try:
-            import secrets as _secrets2
-            db.record_token_usage(
-                session_id=session_id,
-                trace_id=_secrets2.token_hex(8),
-                provider=cfg.provider or "unknown",
-                model=cfg.model or "unknown",
-                prompt_tokens=total_prompt_tokens,
-                completion_tokens=total_completion_tokens,
-                total_tokens=total_prompt_tokens + total_completion_tokens,
-            )
-        except Exception as _te:
-            APP_LOGGER.warning("token usage record failed (non-stream): %s", _te)
 
     # Build a lightweight plan_exec dict for response compatibility
     plan_exec = build_light_plan_exec(payload.message)
@@ -978,13 +772,13 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
         reply=final_reply,
         brain={
             **plan_exec,
-            "strategy": "llm-react" if not is_mock else "mock-react",
+            "strategy": "langgraph-react",
             "react_trace": react_trace,
             "executed_tools": executed_results,
             "memory": {
                 "session_id": session_id,
-                "short_term_messages": len((memory_ctx.get("short_term") or {}).get("messages") or []),
-                "retrieved_long_term": len(memory_ctx.get("long_term") or []),
+                "short_term_messages": len(((graph_out.get("memory_ctx") or {}).get("short_term") or {}).get("messages") or []),
+                "retrieved_long_term": len((graph_out.get("memory_ctx") or {}).get("long_term") or []),
                 "summary": memory_update.get("summary") or "",
                 "state": memory_update.get("state") or {},
             },
@@ -1068,126 +862,40 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
                 return
 
         else:
-            # ── Legacy ReAct path ────────────────────────────────────────
-            available_tool_names: set[str] = {t["name"] for t in enabled_tools}
-            react_trace: list[dict[str, Any]] = []
+            # ── ChatGraphEngine ReAct path (fallback when PlannerExecutor unavailable) ──
+            yield _sse({"type": "step", "step": "think", "detail": "启动 LangGraph ReAct 推理…"})
             executed_results = []
-            last_result: Any = None
             final_reply = ""
             total_prompt_tokens = 0
             total_completion_tokens = 0
 
-            # memory retrieval
-            yield _sse({"type": "step", "step": "memory", "detail": "正在检索记忆上下文…"})
-            db.add_message("user", _safe_message, session_id=session_id)
-            memory_ctx = memory_manager.retrieve_context(_safe_message, session_id=session_id)
-            memory_prompt = str(memory_ctx.get("memory_prompt") or "").strip()
-            long_term_count = len(memory_ctx.get("long_term") or [])
-            if long_term_count:
-                yield _sse({"type": "step", "step": "memory", "detail": f"召回 {long_term_count} 条相关记忆"})
+            try:
+                graph_out = chat_graph_engine.run(
+                    message=_safe_message,
+                    cfg=cfg,
+                    session_id=session_id,
+                    force_tool=payload.force_tool,
+                    tool_params=payload.tool_params,
+                    enabled_tools=enabled_tools,
+                    is_mock=is_mock,
+                )
+                executed_results = list(graph_out.get("executed_results") or [])
+                final_reply = str(graph_out.get("final_reply") or "")
 
-            MAX_STEPS = 6
+                # Emit tool execution events
+                for er in executed_results:
+                    yield _sse({"type": "step", "step": "tool", "detail": f"调用工具: {er.get('tool', '')}"})
+                    yield _sse({"type": "step", "step": "tool_done", "detail": f"工具 {er.get('tool', '')} 执行完毕"})
 
-            # force_tool
-            if payload.force_tool:
-                yield _sse({"type": "step", "step": "tool", "detail": f"强制调用工具: {payload.force_tool}"})
-                call_params = {k: str(v) for k, v in (payload.tool_params or {}).items()}
-                try:
-                    result = tool_registry.execute(payload.force_tool, call_params, authorized=True)
-                except Exception as exc:
-                    result = {"error": str(exc)}
-                executed_results.append({"tool": payload.force_tool, "params": call_params, "reason": "force_tool", "result": result})
-                react_trace.append({"thought": f"User requested tool: {payload.force_tool}", "action": {"tool": payload.force_tool, "params": call_params}, "observation": result})
-                last_result = result
-                yield _sse({"type": "step", "step": "tool_done", "detail": f"工具 {payload.force_tool} 执行完毕"})
-
-            # ReAct loop
-            if not is_mock:
-                react_system_prompt = build_react_system_prompt(enabled_tools)
-                yield _sse({"type": "step", "step": "think", "detail": "开始推理…"})
-
-                for _step in range(MAX_STEPS):
-                    question = payload.message if not memory_prompt else f"{payload.message}\n\n[Memory Context]\n{memory_prompt}"
-                    scratchpad = build_react_scratchpad(question, react_trace)
-                    try:
-                        raw_output, usage = llm_client.call_with_usage(
-                            scratchpad, cfg,
-                            context=[{"role": "system", "content": react_system_prompt}],
-                            system_prompt=system_prompt,
-                        )
-                        total_prompt_tokens += usage.prompt_tokens
-                        total_completion_tokens += usage.completion_tokens
-                    except LLMProviderError as exc:
-                        yield _sse({"type": "error", "message": exc.message})
-                        return
-
-                    decision = parse_react_llm_output(raw_output, available_tool_names)
-                    if decision.thought:
-                        yield _sse({"type": "step", "step": "thought", "detail": decision.thought[:200]})
-                    if decision.should_stop or decision.action is None:
-                        final_reply = decision.final_answer or raw_output
-                        react_trace.append({"thought": decision.thought, "action": None, "observation": {"stop_reason": decision.stop_reason or "final_answer"}})
-                        break
-
-                    call = decision.action
-                    yield _sse({"type": "step", "step": "tool", "detail": f"调用工具: {call.name}({json.dumps(call.params, ensure_ascii=False)[:80]})"})
-                    resolved_params: dict[str, Any] = {}
-                    for key, value in call.params.items():
-                        if isinstance(value, str) and value.startswith("{{tool:") and value.endswith("}}"):
-                            ref_name = value[7:-2]
-                            ref = next((item for item in reversed(executed_results) if item["tool"] == ref_name), None)
-                            resolved_params[key] = json.dumps(ref["result"], ensure_ascii=False) if ref else ""
-                        else:
-                            resolved_params[key] = value
-                    try:
-                        result = tool_registry.execute(call.name, resolved_params, authorized=True)
-                    except Exception as exc:
-                        result = {"error": str(exc)}
-                    executed_results.append({"tool": call.name, "params": resolved_params, "reason": call.reason, "result": result})
-                    react_trace.append({"thought": decision.thought, "action": {"tool": call.name, "params": resolved_params}, "observation": result})
-                    last_result = result
-                    yield _sse({"type": "step", "step": "tool_done", "detail": f"工具 {call.name} 返回结果"})
-                else:
-                    react_trace.append({"thought": "Max steps reached.", "action": None, "observation": {"stop_reason": "max_steps_reached"}})
-                    yield _sse({"type": "step", "step": "think", "detail": "已达最大推理步骤，开始生成回答…"})
-
-            # Final streaming answer
-            yield _sse({"type": "step", "step": "answer", "detail": "正在生成回答…"})
-            if not final_reply:
-                if executed_results:
-                    summary_prompt = (
-                        f"用户输入: {_safe_message}\n"
-                        f"记忆上下文: {memory_prompt or '无'}\n"
-                        f"ReAct轨迹: {json.dumps(react_trace, ensure_ascii=False)}\n"
-                        f"工具执行结果: {json.dumps(executed_results, ensure_ascii=False)}\n"
-                        f"请根据以上信息给出最终回答。"
-                    )
-                else:
-                    summary_prompt = _safe_message if not memory_prompt else f"{_safe_message}\n\n参考记忆:\n{memory_prompt}"
-
-                context_messages = memory_ctx.get("context_messages") or db.list_messages(limit=20, session_id=session_id)
-                tokens: list[str] = []
-                try:
-                    for token in llm_client.stream(summary_prompt, cfg, context_messages):
-                        tokens.append(token)
-                        yield _sse({"type": "token", "text": token})
-                    final_reply = "".join(tokens)
-                except LLMProviderError as exc:
-                    yield _sse({"type": "error", "message": exc.message})
-                    return
-            else:
+                # Stream the final reply word-by-word
+                yield _sse({"type": "step", "step": "answer", "detail": "正在生成回答…"})
                 words = final_reply.split()
                 for i, word in enumerate(words):
                     yield _sse({"type": "token", "text": ("" if i == 0 else " ") + word})
 
-            # Persist & memory update (legacy path only – planner handles this internally)
-            db.add_message("assistant", final_reply, session_id=session_id)
-            memory_manager.update_after_turn(
-                user_message=_safe_message,
-                assistant_reply=final_reply,
-                session_id=session_id,
-                tool_trace=executed_results,
-            )
+            except LLMProviderError as exc:
+                yield _sse({"type": "error", "message": exc.message})
+                return
 
         # ── Record token usage ───────────────────────────────────────────
         if total_prompt_tokens or total_completion_tokens:
