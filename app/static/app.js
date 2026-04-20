@@ -116,25 +116,60 @@ function applyTranslations() {
 }
 
 function renderMarkdown(text) {
-  if (typeof marked !== 'undefined') {
-    try {
-      // Configure highlight.js renderer once
-      if (typeof hljs !== 'undefined' && !renderMarkdown._configured) {
-        marked.setOptions({
-          highlight: (code, lang) => {
-            if (lang && hljs.getLanguage(lang)) {
-              return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
-            }
-            return hljs.highlightAuto(code).value;
-          },
-          langPrefix: 'hljs language-',
-        });
-        renderMarkdown._configured = true;
+  if (!text) return '';
+
+  // ── Try marked library ──
+  if (typeof marked !== 'undefined' && typeof marked.parse === 'function') {
+    // Configure highlight extension once
+    if (!renderMarkdown._configured) {
+      try {
+        if (typeof hljs !== 'undefined' && typeof markedHighlight !== 'undefined' &&
+            typeof markedHighlight.markedHighlight === 'function') {
+          marked.use(markedHighlight.markedHighlight({
+            langPrefix: 'hljs language-',
+            highlight(code, lang) {
+              if (lang && hljs.getLanguage(lang)) {
+                return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
+              }
+              return hljs.highlightAuto(code).value;
+            },
+          }));
+        }
+      } catch (e) {
+        console.warn('[renderMarkdown] highlight setup error:', e);
       }
-      return marked.parse(text, { breaks: true, gfm: true });
-    } catch (e) { /* fall through */ }
+      renderMarkdown._configured = true;
+    }
+    try {
+      const html = marked.parse(text, { breaks: true, gfm: true });
+      if (typeof html === 'string') return html;
+    } catch (e) {
+      console.warn('[renderMarkdown] marked.parse error:', e);
+    }
   }
-  return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g ,'<br>');
+
+  // ── Fallback: basic markdown → HTML ──
+  let s = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  // code blocks ```
+  s = s.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="language-$1">$2</code></pre>');
+  // inline code
+  s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // bold
+  s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  // italic
+  s = s.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  // headings
+  s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  s = s.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  s = s.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+  // unordered list
+  s = s.replace(/^[-*] (.+)$/gm, '<li>$1</li>');
+  // line breaks (outside <pre>)
+  s = s.replace(/\n/g, '<br>');
+  return s;
 }
 
 /** Wrap pre>code blocks with copy button after inserting html */

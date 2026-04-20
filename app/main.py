@@ -3,10 +3,14 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import re
 import secrets
 import zipfile
 from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()
 from typing import Any, Generator
 
 import psutil
@@ -99,7 +103,11 @@ class _JSONFormatter(logging.Formatter):
 
 _log_handler = logging.FileHandler(LOG_DIR / "agent.log", encoding="utf-8")
 _log_handler.setFormatter(_JSONFormatter())
-logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
+_log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+logging.basicConfig(level=_log_level, handlers=[_log_handler])
+# Enable DEBUG for our own loggers (respect LOG_LEVEL if it's higher than DEBUG)
+for _ln in ("pithy_agent", "pithy_agent.react", "pithy_agent.stream", "app.core.llm"):
+    logging.getLogger(_ln).setLevel(_log_level if _log_level > logging.DEBUG else logging.DEBUG)
 
 # ---------------------------------------------------------------------------
 # Application lifespan: startup checks + graceful shutdown
@@ -858,32 +866,45 @@ def _run_react_streaming(
         parse_react_llm_output,
     )
     from app.tools.builtin import CommandNeedsConfirmation as _CNC
+    _log = logging.getLogger("pithy_agent.react")
+
+    _log.debug("[ReAct] session=%s message=%r force_tool=%s", session_id, message[:80], force_tool)
 
     mem_mgr.db.add_message("user", message, session_id=session_id)
     mem_ctx = mem_mgr.retrieve_context(message, session_id=session_id)
     mem_prompt = str(mem_ctx.get("memory_prompt") or "")
+    _log.debug("[ReAct] memory retrieved: long_term=%d short_term=%d prompt_len=%d",
+               len(mem_ctx.get("long_term") or []),
+               len(((mem_ctx.get("short_term") or {}).get("messages") or [])),
+               len(mem_prompt))
 
     yield {"type": "step", "step": "memory",
            "detail": f"记忆检索完成{'，召回 ' + str(len(mem_ctx.get('long_term') or [])) + ' 条' if mem_ctx.get('long_term') else ''}"}
 
     available_names = {t.get("name", "") for t in enabled_tools}
+    _log.debug("[ReAct] available tools: %s", ", ".join(sorted(available_names)) or "none")
     react_trace: list[dict[str, Any]] = []
     executed_results: list[dict[str, Any]] = []
 
     # Handle force_tool
     if force_tool:
         params = {k: str(v) for k, v in (tool_params or {}).items()}
+        _log.info("[ReAct] force_tool=%s params=%s", force_tool, params)
         yield {"type": "step", "step": "tool", "detail": f"调用工具: {force_tool}"}
         try:
             result = langchain_adapter.execute_tool(force_tool, params)
         except _CNC:
+            _log.debug("[ReAct] force_tool %s needs confirmation, auto-confirming", force_tool)
             params["confirmed"] = "true"
             try:
                 result = langchain_adapter.execute_tool(force_tool, params)
             except Exception as exc2:
+                _log.warning("[ReAct] force_tool %s failed after confirm: %s", force_tool, exc2)
                 result = {"error": str(exc2)}
         except Exception as exc:
+            _log.warning("[ReAct] force_tool %s failed: %s", force_tool, exc)
             result = {"error": str(exc)}
+        _log.debug("[ReAct] force_tool result: %s", json.dumps(result, ensure_ascii=False)[:200])
         executed_results.append({"tool": force_tool, "params": params, "result": result})
         react_trace.append({"thought": f"Force tool: {force_tool}", "action": {"tool": force_tool, "params": params}, "observation": result})
         yield {"type": "step_start", "index": 1, "task": f"执行 {force_tool}", "step_type": "tool"}
@@ -896,12 +917,19 @@ def _run_react_streaming(
         question = message if not mem_prompt else f"{message}\n\n[Memory Context]\n{mem_prompt}"
         max_steps = 6
         final_streamed = False
+        _log.debug("[ReAct] entering loop, max_steps=%d, system_prompt_len=%d", max_steps, len(react_system))
         for step_i in range(max_steps):
             scratchpad = build_react_scratchpad(question, react_trace)
+            _log.debug("[ReAct] step %d/%d scratchpad_len=%d", step_i + 1, max_steps, len(scratchpad))
             context = [{"role": "system", "content": react_system}]
             raw_output = llm_client.call(scratchpad, cfg, context=context, system_prompt=system_prompt)
+            _log.debug("[ReAct] step %d LLM output (%d chars): %s", step_i + 1, len(raw_output), raw_output[:300])
 
             decision = parse_react_llm_output(raw_output, available_names)
+            _log.debug("[ReAct] step %d decision: should_stop=%s action=%s stop_reason=%s thought=%s",
+                       step_i + 1, decision.should_stop,
+                       decision.action.name if decision.action else None,
+                       decision.stop_reason, decision.thought[:80])
 
             if decision.should_stop or decision.action is None:
                 react_trace.append({"thought": decision.thought, "action": None, "observation": {"stop_reason": decision.stop_reason}})
@@ -909,12 +937,14 @@ def _run_react_streaming(
                 # If this is the first step with no tools called, re-generate
                 # with streaming for a smoother UX
                 if step_i == 0 and not executed_results:
+                    _log.debug("[ReAct] simple answer path — streaming direct LLM response")
                     yield {"type": "step", "step": "answer", "detail": "正在生成回答…"}
                     direct_prompt = message if not mem_prompt else f"{message}\n\n[Memory]\n{mem_prompt}"
                     context_msgs = mem_ctx.get("context_messages") or []
                     for chunk in llm_client.stream(direct_prompt, cfg, context=context_msgs, system_prompt=system_prompt):
                         yield {"type": "token", "text": chunk}
                 else:
+                    _log.debug("[ReAct] final answer after %d tool calls, chunking %d chars", len(executed_results), len(final))
                     yield {"type": "step", "step": "answer", "detail": "正在生成回答…"}
                     for chunk in _chunk_text(final):
                         yield {"type": "token", "text": chunk}
@@ -923,25 +953,34 @@ def _run_react_streaming(
 
             # Tool call
             call = decision.action
+            _log.info("[ReAct] step %d → tool call: %s params=%s", step_i + 1, call.name, call.params)
             yield {"type": "step_start", "index": step_i + 1, "task": decision.thought[:100], "step_type": "tool"}
             yield {"type": "step", "step": "tool", "detail": f"调用工具: {call.name}"}
             try:
                 result = langchain_adapter.execute_tool(call.name, call.params)
             except _CNC:
+                _log.debug("[ReAct] tool %s needs confirmation, auto-confirming", call.name)
                 call.params["confirmed"] = "true"
                 try:
                     result = langchain_adapter.execute_tool(call.name, call.params)
                 except Exception as exc2:
+                    _log.warning("[ReAct] tool %s failed after confirm: %s", call.name, exc2)
                     result = {"error": str(exc2)}
             except Exception as exc:
+                _log.warning("[ReAct] tool %s failed: %s", call.name, exc)
                 result = {"error": str(exc)}
 
+            _log.debug("[ReAct] step %d tool result: %s", step_i + 1, json.dumps(result, ensure_ascii=False)[:300])
             executed_results.append({"tool": call.name, "params": call.params, "result": result})
             react_trace.append({"thought": decision.thought, "action": {"tool": call.name, "params": call.params}, "observation": result})
             yield {"type": "step_done", "index": step_i + 1, "tool": call.name, "output": json.dumps(result, ensure_ascii=False)[:500]}
             yield {"type": "step", "step": "tool_done", "detail": f"工具 {call.name} 执行完毕"}
+
+        if not final_streamed:
+            _log.debug("[ReAct] loop ended without final answer (max_steps reached or all tool calls)")
     else:
         # Mock mode
+        _log.debug("[ReAct] mock mode")
         final_streamed = True
         final = f"[MockAgent] {message}"
         yield {"type": "step", "step": "answer", "detail": "Mock 回答"}
@@ -949,6 +988,7 @@ def _run_react_streaming(
 
     # If no final answer was streamed yet (all steps were tool calls), generate summary
     if not is_mock and not final_streamed and react_trace and react_trace[-1].get("action") is not None:
+        _log.info("[ReAct] generating summary after %d tool calls", len(executed_results))
         summary_prompt = (
             f"用户输入: {message}\n"
             f"记忆上下文: {mem_prompt or '无'}\n"
@@ -959,22 +999,20 @@ def _run_react_streaming(
         for chunk in llm_client.stream(summary_prompt, cfg, system_prompt=system_prompt):
             yield {"type": "token", "text": chunk}
 
-    # Persist
-    # Note: final_reply will be assembled by the caller from token events
-    mem_mgr.db.add_message("assistant", "", session_id=session_id)  # placeholder
-    mem_mgr.update_after_turn(
-        user_message=message,
-        assistant_reply="",
-        session_id=session_id,
-        tool_trace=executed_results,
-    )
+    # NOTE: Do NOT persist here — the caller has the assembled final_reply
+    # and will save it after streaming completes.
+    _log.debug("[ReAct] streaming complete, session=%s executed_tools=%d", session_id, len(executed_results))
 
 
 def _chunk_text(text: str, chunk_size: int = 4) -> Generator:
-    """Split text into small chunks for streaming."""
-    words = text.split()
-    for i, word in enumerate(words):
-        yield ("" if i == 0 else " ") + word
+    """Split text into small chunks for streaming, preserving newlines."""
+    lines = text.split("\n")
+    for li, line in enumerate(lines):
+        if li > 0:
+            yield "\n"
+        words = line.split(" ")
+        for wi, word in enumerate(words):
+            yield ("" if wi == 0 else " ") + word
 
 
 @app.post("/api/chat/stream")
@@ -983,10 +1021,13 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
 
     def generate():
         import secrets as _secrets, time as _time
+        _log = logging.getLogger("pithy_agent.stream")
+        _t0 = _time.time()
 
         # ── Input guard ───────────────────────────────────────────────
         _guard = InputGuard.check(payload.message)
         if _guard.blocked:
+            _log.warning("[stream] input blocked: %s", _guard.reason)
             yield _sse({"type": "error", "message": _guard.reason})
             return
         _safe_message = _guard.sanitised or payload.message
@@ -995,6 +1036,7 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
 
         # ── Trace ID for this inference run ─────────────────────────────
         trace_id = _secrets.token_hex(8)
+        _log.info("[stream] trace=%s session=%s msg=%r", trace_id, session_id, _safe_message[:80])
         yield _sse({"type": "trace", "trace_id": trace_id})
 
         language = detect_language(_safe_message)
@@ -1002,6 +1044,8 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
         is_mock = (cfg.provider or "mock").lower() == "mock"
         settings = config_store.get_app_settings()
         system_prompt = settings.system_prompt
+        _log.debug("[stream] provider=%s model=%s is_mock=%s tools_enabled=%d",
+                   cfg.provider, cfg.model, is_mock, len([t for t in tool_registry.list_tools() if t.get("enabled", True)]))
 
         all_tools = tool_registry.list_tools()
         enabled_tools = [t for t in all_tools if t.get("enabled", True)]
@@ -1040,6 +1084,17 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
             yield _sse({"type": "error", "message": exc.message})
             return
 
+        # ── Persist assistant message with full content ──────────────────
+        if final_reply:
+            db.add_message("assistant", final_reply, session_id=session_id)
+            memory_manager.update_after_turn(
+                user_message=_safe_message,
+                assistant_reply=final_reply,
+                session_id=session_id,
+                tool_trace=executed_results,
+            )
+            _log.debug("[stream] persisted assistant reply (%d chars) session=%s", len(final_reply), session_id)
+
         # ── Record token usage ───────────────────────────────────────────
         if total_prompt_tokens or total_completion_tokens:
             try:
@@ -1069,6 +1124,8 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
                 "total_tokens": total_prompt_tokens + total_completion_tokens,
             },
         })
+        _log.info("[stream] trace=%s done in %.2fs tools=%d reply_len=%d",
+                  trace_id, _time.time() - _t0, len(executed_results), len(final_reply))
 
     return StreamingResponse(
         generate(),

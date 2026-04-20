@@ -50,6 +50,8 @@ class LLMClient:
     ) -> tuple[str, TokenUsage]:
         """Like call() but also returns TokenUsage."""
         provider = (cfg.provider or "mock").lower()
+        LOGGER.debug("[LLM] call provider=%s model=%s prompt_len=%d context=%d json_mode=%s",
+                     provider, cfg.model, len(prompt), len(context or []), json_mode)
         t0 = time.monotonic()
         if provider == "mock":
             reply = self._mock_reply(prompt, context)
@@ -223,6 +225,9 @@ class LLMClient:
                 total_tokens=int(usage_data.get("total_tokens", 0)),
                 latency_ms=latency_ms,
             )
+            LOGGER.debug("[LLM] response: %dms tokens=%d (prompt=%d completion=%d) reply_len=%d",
+                         latency_ms, usage.total_tokens, usage.prompt_tokens,
+                         usage.completion_tokens, len(reply))
             return reply, usage
         except LLMProviderError:
             raise
@@ -373,10 +378,13 @@ class LLMClient:
         """Simulate streaming for mock provider."""
         import time
         reply = f"[MockAgent] {'(context=' + str(len(context)) + ') ' if context else ''}{prompt}"
-        words = reply.split()
-        for i, word in enumerate(words):
-            yield ('' if i == 0 else ' ') + word
-            time.sleep(0.04)
+        for li, line in enumerate(reply.split("\n")):
+            if li > 0:
+                yield "\n"
+            words = line.split(" ")
+            for wi, word in enumerate(words):
+                yield ('' if wi == 0 else ' ') + word
+                time.sleep(0.04)
 
     def _openai_stream(
         self,
