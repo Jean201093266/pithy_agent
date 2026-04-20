@@ -104,7 +104,14 @@ class _JSONFormatter(logging.Formatter):
 _log_handler = logging.FileHandler(LOG_DIR / "agent.log", encoding="utf-8")
 _log_handler.setFormatter(_JSONFormatter())
 _log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
-logging.basicConfig(level=_log_level, handlers=[_log_handler])
+
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(_log_level)
+_console_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"
+))
+
+logging.basicConfig(level=_log_level, handlers=[_log_handler, _console_handler])
 # Enable DEBUG for our own loggers (respect LOG_LEVEL if it's higher than DEBUG)
 for _ln in ("pithy_agent", "pithy_agent.react", "pithy_agent.stream", "app.core.llm"):
     logging.getLogger(_ln).setLevel(_log_level if _log_level > logging.DEBUG else logging.DEBUG)
