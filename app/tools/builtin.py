@@ -72,20 +72,29 @@ def _is_safe_write_path(path: Path) -> bool:
 def _check_command_safety(cmd: str) -> None:
     """Raise PermissionError if the command matches the blacklist or injection patterns."""
     import re as _re
-    lower_cmd = cmd.lower()
+    # Normalize: strip quotes, collapse whitespace to defeat bypass via cu""rl / cu''rl
+    normalized = cmd.replace('"', '').replace("'", '').replace('`', '').replace('^', '')
+    normalized = _re.sub(r'\s+', ' ', normalized)
+    lower_cmd = normalized.lower()
     for pattern in _CMD_BLACKLIST:
         if pattern in lower_cmd:
             raise PermissionError(
                 f"Command blocked by security policy (matched pattern: '{pattern}'). "
                 "Use a more specific command or adjust the allowed command list."
             )
-    # Check shell injection patterns
+    # Check shell injection patterns (on original cmd)
     for regex_pat in _CMD_INJECTION_PATTERNS:
         if _re.search(regex_pat, cmd, _re.IGNORECASE):
             raise PermissionError(
                 f"Command blocked: potential shell injection detected. "
                 "Avoid command substitution, piping to shells, or chaining destructive commands."
             )
+    # Block path traversal attempts
+    if '../' in cmd or '..\\' in cmd:
+        raise PermissionError(
+            "Command blocked: path traversal detected. "
+            "Use absolute paths instead of relative path traversal."
+        )
 
 
 def check_ocr_availability() -> dict[str, Any]:
@@ -190,10 +199,19 @@ def tool_run_command(params: dict[str, Any]) -> dict[str, Any]:
     # Restrict working directory to data/ by default for safety
     cwd = str(params.get("cwd", _ROOT / "data"))
     timeout = min(int(params.get("timeout", 20)), 60)
-    proc = subprocess.run(
-        cmd, shell=True, capture_output=True, text=True,
-        timeout=timeout, cwd=cwd,
-    )
+    import shlex
+    import platform
+    # On Windows, use shell=True as shlex.split doesn't handle Windows paths well
+    if platform.system() == "Windows":
+        proc = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            timeout=timeout, cwd=cwd,
+        )
+    else:
+        proc = subprocess.run(
+            shlex.split(cmd), shell=False, capture_output=True, text=True,
+            timeout=timeout, cwd=cwd,
+        )
     return {
         "returncode": proc.returncode,
         "stdout": proc.stdout[-5000:],
@@ -241,11 +259,16 @@ def tool_sqlite_query(params: dict[str, Any]) -> dict[str, Any]:
     if not (normalized.startswith("SELECT") or normalized.startswith("PRAGMA")):
         raise PermissionError("only SELECT/PRAGMA queries are allowed")
 
+    # Block multi-statement injection (e.g. "SELECT 1; DROP TABLE ...")
+    if ";" in query:
+        raise PermissionError("multi-statement queries are not allowed")
+
     limit = int(params.get("limit", 100))
     limit = max(1, min(limit, 500))
 
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
         rows = conn.execute(query).fetchmany(limit)
         columns = list(rows[0].keys()) if rows else []
         data = [dict(row) for row in rows]
@@ -273,7 +296,10 @@ def _validate_url_ssrf(url: str) -> None:
                     f"SSRF blocked: {hostname} resolves to private/reserved IP {ip}"
                 )
     except (socket.gaierror, OSError):
-        pass  # Allow if DNS resolution fails (let requests handle it)
+        raise PermissionError(
+            f"SSRF blocked: unable to resolve hostname {hostname}. "
+            "DNS resolution must succeed to validate the target is not a private IP."
+        )
 
 
 def tool_http_request(params: dict[str, Any]) -> dict[str, Any]:

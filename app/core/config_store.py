@@ -57,6 +57,12 @@ class ConfigStore:
             return hashlib.sha256(raw).digest()
         seed = get_random_bytes(32)
         self.secret_path.write_bytes(base64.b64encode(seed))
+        # Restrict file permissions to owner-only (Unix)
+        try:
+            import os, stat
+            os.chmod(self.secret_path, stat.S_IRUSR | stat.S_IWUSR)
+        except (OSError, AttributeError):
+            pass  # Windows doesn't support chmod the same way
         return hashlib.sha256(base64.b64encode(seed)).digest()
 
     def _encrypt(self, text: str) -> str:

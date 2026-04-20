@@ -11,6 +11,18 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=100M
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; r=requests.get('http://localhost:8000/api/health'); r.raise_for_status()"]
       interval: 30s

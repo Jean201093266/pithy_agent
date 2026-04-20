@@ -336,6 +336,7 @@ class LLMClient:
         prompt: str,
         cfg: ModelConfig,
         context: list[dict[str, Any]] | None = None,
+        system_prompt: str | None = None,
     ) -> Generator[str, None, None]:
         """Stream tokens from LLM. Yields text chunks."""
         provider = (cfg.provider or "mock").lower()
@@ -346,10 +347,10 @@ class LLMClient:
             if provider == "tongyi":
                 cfg = ModelConfig(**{**cfg.__dict__})
                 cfg.base_url = cfg.base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
-            yield from self._openai_stream(prompt, cfg, context, provider)
+            yield from self._openai_stream(prompt, cfg, context, provider, system_prompt=system_prompt)
             return
         # fallback: non-streaming call
-        result = self.call(prompt, cfg, context)
+        result = self.call(prompt, cfg, context, system_prompt=system_prompt)
         yield result
 
     def _mock_stream(
@@ -371,6 +372,7 @@ class LLMClient:
         cfg: ModelConfig,
         context: list[dict[str, Any]] | None = None,
         provider: str = "openai",
+        system_prompt: str | None = None,
     ) -> Generator[str, None, None]:
         """Stream tokens from OpenAI-compatible API."""
         if not cfg.api_key:
@@ -394,11 +396,7 @@ class LLMClient:
                     status_code=400,
                 )
 
-        messages = [{"role": "system", "content": "You are a helpful local agent."}]
-        if context:
-            for item in context[-8:]:
-                messages.append({"role": item["role"], "content": item["content"]})
-        messages.append({"role": "user", "content": prompt})
+        messages = self._build_messages(prompt, cfg, context, system_prompt=system_prompt)
 
         url = f"{base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {cfg.api_key}"}

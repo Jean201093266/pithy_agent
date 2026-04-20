@@ -83,11 +83,28 @@ DATA_DIR = ROOT / "data"
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(
-    filename=LOG_DIR / "agent.log",
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-)
+
+class _JSONFormatter(logging.Formatter):
+    """Emit one JSON object per log line for structured logging."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        import time as _t
+        entry = {
+            "ts": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if hasattr(record, "trace_id"):
+            entry["trace_id"] = record.trace_id
+        if record.exc_info and record.exc_info[1]:
+            entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(entry, ensure_ascii=False)
+
+
+_log_handler = logging.FileHandler(LOG_DIR / "agent.log", encoding="utf-8")
+_log_handler.setFormatter(_JSONFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 
 app = FastAPI(title="Pithy Local Agent", version="0.1.0")
 app.add_middleware(
@@ -125,27 +142,44 @@ except ImportError:
     limiter = None
 
 # ---------------------------------------------------------------------------
-# Security headers middleware
+# Security headers middleware (pure ASGI to avoid SSE buffering issues)
 # ---------------------------------------------------------------------------
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response as _StarletteResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        response: _StarletteResponse = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; "
-            "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
-            "style-src 'self' https://cdn.jsdelivr.net https://fonts.googleapis.com 'unsafe-inline'; "
-            "font-src 'self' https://fonts.gstatic.com; "
-            "img-src 'self' data:; "
-            "connect-src 'self'"
-        )
-        return response
+class SecurityHeadersMiddleware:
+    """Add security headers without buffering the response body (SSE-safe)."""
+
+    HEADERS = [
+        (b"x-content-type-options", b"nosniff"),
+        (b"x-frame-options", b"DENY"),
+        (b"referrer-policy", b"strict-origin-when-cross-origin"),
+        (b"content-security-policy", (
+            b"default-src 'self'; "
+            b"script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+            b"style-src 'self' https://cdn.jsdelivr.net https://fonts.googleapis.com 'unsafe-inline'; "
+            b"font-src 'self' https://fonts.gstatic.com; "
+            b"img-src 'self' data:; "
+            b"connect-src 'self'"
+        )),
+    ]
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.extend(self.HEADERS)
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 
 app.add_middleware(SecurityHeadersMiddleware)
@@ -171,6 +205,142 @@ AUTH_STATE: dict[str, Any] = {
 }
 
 _TOKEN_MAX_AGE_SECONDS = 86400  # 24 hours
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers to reduce duplication between chat() and chat_stream()
+# ---------------------------------------------------------------------------
+
+def _ensure_session(session_id: str | None) -> str:
+    """Ensure session exists, create if needed. Returns session_id."""
+    import secrets as _secrets
+    import time as _time
+    sid = (session_id or "").strip()
+    if not sid:
+        sid = f"session_{int(_time.time() * 1000)}_{_secrets.token_hex(4)}"
+        db.create_session(sid, "新会话")
+    else:
+        # Use direct query instead of listing all sessions
+        with db.connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM chat_sessions WHERE session_id = ?", (sid,)
+            ).fetchone()
+        if not exists:
+            db.create_session(sid, sid)
+    return sid
+
+
+def _resolve_tool_params(
+    params: dict[str, Any],
+    executed_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Resolve {{tool:xxx}} template references in params."""
+    resolved: dict[str, Any] = {}
+    for key, value in params.items():
+        if isinstance(value, str) and value.startswith("{{tool:") and value.endswith("}}"):
+            ref_name = value[7:-2]
+            ref = next((item for item in reversed(executed_results) if item["tool"] == ref_name), None)
+            resolved[key] = json.dumps(ref["result"], ensure_ascii=False) if ref else ""
+        else:
+            resolved[key] = value
+    return resolved
+
+
+def _run_react_loop(
+    message: str,
+    cfg: Any,
+    enabled_tools: list[dict[str, Any]],
+    memory_prompt: str,
+    react_trace: list[dict[str, Any]],
+    executed_results: list[dict[str, Any]],
+    system_prompt_override: str | None = None,
+) -> tuple[str, int, int]:
+    """Execute the ReAct reasoning loop. Returns (final_reply, prompt_tokens, completion_tokens)."""
+    MAX_STEPS = 6
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    final_reply = ""
+    available_tool_names: set[str] = {t["name"] for t in enabled_tools}
+    system_prompt = build_react_system_prompt(enabled_tools)
+
+    for _step in range(MAX_STEPS):
+        question = message if not memory_prompt else f"{message}\n\n[Memory Context]\n{memory_prompt}"
+        scratchpad = build_react_scratchpad(question, react_trace)
+        ctx = [{"role": "system", "content": system_prompt}]
+        kwargs: dict[str, Any] = {}
+        if system_prompt_override:
+            kwargs["system_prompt"] = system_prompt_override
+        raw_output, usage = llm_client.call_with_usage(scratchpad, cfg, context=ctx, **kwargs)
+        total_prompt_tokens += usage.prompt_tokens
+        total_completion_tokens += usage.completion_tokens
+
+        decision = parse_react_llm_output(raw_output, available_tool_names)
+
+        if decision.should_stop or decision.action is None:
+            final_reply = decision.final_answer or raw_output
+            react_trace.append({
+                "thought": decision.thought,
+                "action": None,
+                "observation": {"stop_reason": decision.stop_reason or "final_answer"},
+            })
+            break
+
+        call = decision.action
+        resolved_params = _resolve_tool_params(call.params, executed_results)
+
+        try:
+            result = tool_registry.execute(call.name, resolved_params, authorized=True)
+        except Exception as exc:
+            result = {"error": str(exc)}
+
+        executed_results.append({
+            "tool": call.name,
+            "params": resolved_params,
+            "reason": call.reason,
+            "result": result,
+        })
+        react_trace.append({
+            "thought": decision.thought,
+            "action": {"tool": call.name, "params": resolved_params},
+            "observation": result,
+        })
+    else:
+        react_trace.append({
+            "thought": "Max steps reached.",
+            "action": None,
+            "observation": {"stop_reason": "max_steps_reached"},
+        })
+
+    return final_reply, total_prompt_tokens, total_completion_tokens
+
+
+def _auto_title_session(session_id: str, cfg: Any = None) -> str:
+    """Auto-generate session title if needed. Returns title or empty string."""
+    try:
+        with db.connect() as conn:
+            row = conn.execute(
+                """SELECT s.name, COUNT(c.id) AS message_count
+                   FROM chat_sessions s
+                   LEFT JOIN conversations c ON c.session_id = s.session_id
+                   WHERE s.session_id = ?
+                   GROUP BY s.session_id""",
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return ""
+        current_name = row["name"] or ""
+        msg_count = int(row["message_count"])
+        _auto_names = {"新会话", session_id, "default", ""}
+        needs_title = current_name in _auto_names or current_name.startswith("session_")
+        if needs_title and msg_count <= 4:
+            title = _generate_session_title(session_id, cfg)
+            if title:
+                db.rename_session(session_id, title)
+            return title
+        return current_name
+    except Exception as _e:
+        APP_LOGGER.warning("auto title generation failed: %s", _e)
+        return ""
 
 
 def _is_unlocked(request: Request | None = None) -> bool:
@@ -567,17 +737,7 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     if guard.blocked:
         raise HTTPException(status_code=400, detail={"code": "INPUT_BLOCKED", "message": guard.reason})
     payload = ChatRequest(**{**payload.model_dump(), "message": guard.sanitised or payload.message})
-    raw_session_id = (payload.session_id or "").strip()
-    session_id = raw_session_id
-    if not session_id:
-        import secrets as _secrets
-        import time as _time
-        session_id = f"session_{int(_time.time() * 1000)}_{_secrets.token_hex(4)}"
-        db.create_session(session_id, "新会话")
-    else:
-        known_sessions = {item["session_id"] for item in db.list_sessions()}
-        if session_id not in known_sessions:
-            db.create_session(session_id, session_id)
+    session_id = _ensure_session(payload.session_id)
     language = detect_language(payload.message)
 
     cfg = config_store.get_model_config()
@@ -586,12 +746,13 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     # Build available tools list for the prompt and parser
     all_tools = tool_registry.list_tools()
     enabled_tools = [t for t in all_tools if t.get("enabled", True)]
-    available_tool_names: set[str] = {t["name"] for t in enabled_tools}
 
     react_trace: list[dict[str, Any]] = []
     executed_results: list[dict[str, Any]] = []
     last_result: Any | None = None
     final_reply: str = ""
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
 
     use_langgraph = chat_graph_engine.available
     if use_langgraph:
@@ -612,20 +773,7 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
             memory_update = dict(graph_out.get("memory_update") or {})
 
             plan_exec = build_light_plan_exec(payload.message)
-            # Auto-generate title for the langgraph path too
-            _lg_session_name = ""
-            try:
-                _sg_info = next((s for s in db.list_sessions() if s["session_id"] == session_id), None)
-                if _sg_info:
-                    _cn = _sg_info.get("name", "")
-                    if _cn in {"新会话", session_id, "default", ""} or _cn.startswith("session_"):
-                        _lg_session_name = _generate_session_title(session_id)
-                        if _lg_session_name:
-                            db.rename_session(session_id, _lg_session_name)
-                    else:
-                        _lg_session_name = _cn
-            except Exception as _le:
-                APP_LOGGER.warning("lg auto title failed: %s", _le)
+            _lg_session_name = _auto_title_session(session_id, cfg)
             return ChatResponse(
                 session_id=session_id,
                 session_name=_lg_session_name,
@@ -657,9 +805,6 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     memory_ctx = memory_manager.retrieve_context(payload.message, session_id=session_id)
     memory_prompt = str(memory_ctx.get("memory_prompt") or "").strip()
 
-    MAX_STEPS = 6
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
 
     # ------------------------------------------------------------------ #
     # If a force_tool is specified, honour it immediately (first step)     #
@@ -687,68 +832,18 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     # LLM-driven ReAct loop (skipped for mock provider to stay predictable)
     # ------------------------------------------------------------------ #
     if not is_mock:
-        system_prompt = build_react_system_prompt(enabled_tools)
-
-        for _step in range(MAX_STEPS):
-            question = payload.message if not memory_prompt else f"{payload.message}\n\n[Memory Context]\n{memory_prompt}"
-            scratchpad = build_react_scratchpad(question, react_trace)
-            try:
-                raw_output, usage = llm_client.call_with_usage(
-                    scratchpad,
-                    cfg,
-                    context=[{"role": "system", "content": system_prompt}],
-                )
-                total_prompt_tokens += usage.prompt_tokens
-                total_completion_tokens += usage.completion_tokens
-            except LLMProviderError as exc:
-                raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
-
-            decision = parse_react_llm_output(raw_output, available_tool_names)
-
-            if decision.should_stop or decision.action is None:
-                final_reply = decision.final_answer or raw_output
-                react_trace.append({
-                    "thought": decision.thought,
-                    "action": None,
-                    "observation": {"stop_reason": decision.stop_reason or "final_answer"},
-                })
-                break
-
-            call = decision.action
-            # Resolve {{tool:xxx}} template references
-            resolved_params: dict[str, Any] = {}
-            for key, value in call.params.items():
-                if isinstance(value, str) and value.startswith("{{tool:") and value.endswith("}}"):
-                    ref_name = value[7:-2]
-                    ref = next((item for item in reversed(executed_results) if item["tool"] == ref_name), None)
-                    resolved_params[key] = json.dumps(ref["result"], ensure_ascii=False) if ref else ""
-                else:
-                    resolved_params[key] = value
-
-            try:
-                result = tool_registry.execute(call.name, resolved_params, authorized=True)
-            except Exception as exc:
-                result = {"error": str(exc)}
-
-            executed_results.append({
-                "tool": call.name,
-                "params": resolved_params,
-                "reason": call.reason,
-                "result": result,
-            })
-            react_trace.append({
-                "thought": decision.thought,
-                "action": {"tool": call.name, "params": resolved_params},
-                "observation": result,
-            })
-            last_result = result
-        else:
-            # Max steps reached – ask LLM to summarise
-            react_trace.append({
-                "thought": "Max steps reached.",
-                "action": None,
-                "observation": {"stop_reason": "max_steps_reached"},
-            })
+        try:
+            final_reply, total_prompt_tokens, total_completion_tokens = _run_react_loop(
+                message=payload.message,
+                cfg=cfg,
+                enabled_tools=enabled_tools,
+                memory_prompt=memory_prompt,
+                react_trace=react_trace,
+                executed_results=executed_results,
+            )
+            last_result = executed_results[-1]["result"] if executed_results else last_result
+        except LLMProviderError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
 
     # ------------------------------------------------------------------ #
     # Final LLM call: summarise with full context (or first call for mock) #
@@ -800,24 +895,7 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     plan_exec = build_light_plan_exec(payload.message)
 
     # ── Auto-generate session title after first exchange ─────────────────
-    session_name = ""
-    try:
-        session_info = next(
-            (s for s in db.list_sessions() if s["session_id"] == session_id), None
-        )
-        if session_info:
-            current_name = session_info.get("name", "")
-            msg_count = int(session_info.get("message_count", 0))
-            _auto_names = {"新会话", session_id, "default", ""}
-            needs_title = current_name in _auto_names or current_name.startswith("session_")
-            if needs_title and msg_count <= 4:
-                session_name = _generate_session_title(session_id, cfg)
-                if session_name:
-                    db.rename_session(session_id, session_name)
-            else:
-                session_name = current_name
-    except Exception as _e:
-        APP_LOGGER.warning("auto title generation failed: %s", _e)
+    session_name = _auto_title_session(session_id, cfg)
 
     return ChatResponse(
         session_id=session_id,
@@ -870,15 +948,7 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
             return
         _safe_message = _guard.sanitised or payload.message
 
-        raw_session_id = (payload.session_id or "").strip()
-        session_id = raw_session_id
-        if not session_id:
-            session_id = f"session_{int(_time.time() * 1000)}_{_secrets.token_hex(4)}"
-            db.create_session(session_id, "新会话")
-        else:
-            known = {s["session_id"] for s in db.list_sessions()}
-            if session_id not in known:
-                db.create_session(session_id, session_id)
+        session_id = _ensure_session(payload.session_id)
 
         # ── Trace ID for this inference run ─────────────────────────────
         trace_id = _secrets.token_hex(8)
@@ -1064,21 +1134,7 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
                 APP_LOGGER.warning("token usage record failed: %s", _te)
 
         # ── Auto-title ───────────────────────────────────────────────────
-        session_name = ""
-        try:
-            session_info = next((s for s in db.list_sessions() if s["session_id"] == session_id), None)
-            if session_info:
-                current_name = session_info.get("name", "")
-                msg_count = int(session_info.get("message_count", 0))
-                if current_name in {"新会话", session_id, "default", ""} or current_name.startswith("session_"):
-                    if msg_count <= 4:
-                        session_name = _generate_session_title(session_id, cfg)
-                        if session_name:
-                            db.rename_session(session_id, session_name)
-                else:
-                    session_name = current_name
-        except Exception as _e:
-            APP_LOGGER.warning("stream auto title failed: %s", _e)
+        session_name = _auto_title_session(session_id, cfg)
 
         yield _sse({
             "type": "done",
@@ -1131,8 +1187,9 @@ def _generate_session_title(session_id: str, cfg: "ModelConfig | None" = None) -
 def generate_session_title_api(session_id: str, request: Request) -> dict[str, Any]:
     """Manually trigger title generation for a session."""
     _require_unlocked(request)
-    sessions = {s["session_id"] for s in db.list_sessions()}
-    if session_id not in sessions:
+    with db.connect() as conn:
+        exists = conn.execute("SELECT 1 FROM chat_sessions WHERE session_id = ?", (session_id,)).fetchone()
+    if not exists:
         raise HTTPException(status_code=404, detail="session not found")
     cfg = config_store.get_model_config()
     title = _generate_session_title(session_id, cfg)
@@ -1163,8 +1220,9 @@ def global_token_stats(request: Request) -> dict[str, Any]:
 def export_session(session_id: str, request: Request, format: str = "markdown") -> dict[str, Any]:
     """Export conversation as markdown or JSON."""
     _require_unlocked(request)
-    sessions = {s["session_id"] for s in db.list_sessions()}
-    if session_id not in sessions:
+    with db.connect() as conn:
+        exists = conn.execute("SELECT 1 FROM chat_sessions WHERE session_id = ?", (session_id,)).fetchone()
+    if not exists:
         raise HTTPException(status_code=404, detail="session not found")
     messages = db.list_messages(limit=500, session_id=session_id)
     if format == "json":
@@ -1179,6 +1237,9 @@ def export_session(session_id: str, request: Request, format: str = "markdown") 
         content = "\n".join(lines)
         filename = f"session-{session_id[:8]}.md"
     return {"content": content, "filename": filename, "format": format}
+
+
+@app.get("/api/history")
 def history(request: Request, session_id: str = Query(default="")) -> list[dict[str, Any]]:
     _require_unlocked(request)
     sid = (session_id or "").strip()

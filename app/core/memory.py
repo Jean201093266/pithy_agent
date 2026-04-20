@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.core.db import AppDB
+from app.core.embeddings import cosine_similarity, embed_text
 
 
 @dataclass
@@ -212,27 +213,6 @@ class MemoryManager:
         return facts
 
     def _embed_text(self, text: str, dims: int = 64) -> list[float]:
-        # Use LLMClient.embed() if available (sentence-transformers or API)
-        if self._llm_client is not None:
-            try:
-                from app.core.config_store import ModelConfig
-                cfg = ModelConfig()  # minimal config for local embedding
-                return self._llm_client.embed(text, cfg)
-            except Exception:
-                pass
-        # Fallback: hash-based pseudo-embedding
-        tokens = re.findall(r"[\w\u4e00-\u9fff]+", text.lower())
-        vec = [0.0] * dims
-        if not tokens:
-            return vec
-        for token in tokens:
-            h = hash(token)
-            idx = h % dims
-            sign = 1.0 if (h >> 1) & 1 else -1.0
-            vec[idx] += sign
-
-        norm = math.sqrt(sum(v * v for v in vec))
-        if norm <= 0.0:
-            return vec
-        return [v / norm for v in vec]
+        """Generate text embedding using shared utility."""
+        return embed_text(text, dims)
 

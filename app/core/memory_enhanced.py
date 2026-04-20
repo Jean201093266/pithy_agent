@@ -22,6 +22,7 @@ from typing import Any, Optional
 from enum import Enum
 
 from app.core.db import AppDB
+from app.core.embeddings import cosine_similarity, embed_text
 
 LOGGER = logging.getLogger(__name__)
 
@@ -155,15 +156,7 @@ class MemoryDeduplicator:
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:
         """Compute cosine similarity."""
-        size = min(len(a), len(b))
-        if size == 0:
-            return 0.0
-        dot = sum(float(a[i]) * float(b[i]) for i in range(size))
-        norm_a = math.sqrt(sum(float(a[i]) * float(a[i]) for i in range(size)))
-        norm_b = math.sqrt(sum(float(b[i]) * float(b[i]) for i in range(size)))
-        if norm_a <= 0.0 or norm_b <= 0.0:
-            return 0.0
-        return dot / (norm_a * norm_b)
+        return cosine_similarity(a, b)
 
 
 class MemoryRanker:
@@ -239,16 +232,7 @@ class MemoryRanker:
 
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:
-        """Compute cosine similarity."""
-        size = min(len(a), len(b))
-        if size == 0:
-            return 0.0
-        dot = sum(float(a[i]) * float(b[i]) for i in range(size))
-        norm_a = math.sqrt(sum(float(a[i]) * float(a[i]) for i in range(size)))
-        norm_b = math.sqrt(sum(float(b[i]) * float(b[i]) for i in range(size)))
-        if norm_a <= 0.0 or norm_b <= 0.0:
-            return 0.0
-        return dot / (norm_a * norm_b)
+        return cosine_similarity(a, b)
 
 
 class ContextComposer:
@@ -479,6 +463,7 @@ class EnhancedMemoryManager:
         self.composer = ContextComposer(self.config)
         self.reflector = ReflectionEngine(db, self.config)
         self._recent_turns: dict[str, list[dict[str, Any]]] = {}
+        self._turn_counter: dict[str, int] = {}  # throttle pruning
 
     def retrieve_context(
         self,
@@ -563,7 +548,7 @@ class EnhancedMemoryManager:
         tool_trace = tool_trace or []
         added = 0
 
-        # Track for reflection
+        # Track for reflection (capped to prevent unbounded growth)
         if session_id not in self._recent_turns:
             self._recent_turns[session_id] = []
         self._recent_turns[session_id].append({
@@ -572,6 +557,14 @@ class EnhancedMemoryManager:
             "success": success,
             "tools": [t.get("tool") for t in tool_trace],
         })
+        # Cap per-session recent turns to 50
+        if len(self._recent_turns[session_id]) > 50:
+            self._recent_turns[session_id] = self._recent_turns[session_id][-50:]
+        # Cap total sessions tracked to 100
+        if len(self._recent_turns) > 100:
+            oldest_keys = sorted(self._recent_turns.keys())[:-100]
+            for k in oldest_keys:
+                del self._recent_turns[k]
 
         # Add episodic memory
         episode = {
@@ -631,9 +624,11 @@ class EnhancedMemoryManager:
                 added += 1
                 reflection_memory = reflection
 
-        # Prune and clean memories
-        self._prune_long_term_memory(session_id)
-        self._clean_stale_memories(session_id)
+        # Prune and clean memories (throttled: every 10 turns)
+        self._turn_counter[session_id] = self._turn_counter.get(session_id, 0) + 1
+        if self._turn_counter[session_id] % 10 == 0:
+            self._prune_long_term_memory(session_id)
+            self._clean_stale_memories(session_id)
 
         return {
             "added_memory_items": added,
@@ -816,43 +811,8 @@ class EnhancedMemoryManager:
 
     @staticmethod
     def _embed_text(text: str, dims: int = 64) -> list[float]:
-        """Generate text embedding.
-
-        Delegates to LLMClient.embed() which tries, in order:
-        1. sentence-transformers (local)
-        2. OpenAI-compatible embeddings API
-        3. Hash-based pseudo-embedding (fallback)
-
-        Since this is a static method called without access to the LLMClient,
-        we replicate the local sentence-transformers + fallback logic here.
-        The LLMClient.embed() method is used by MemoryManager when available.
-        """
-        # Try sentence-transformers
-        try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
-            if not hasattr(MemoryManager, "_st_model"):
-                MemoryManager._st_model = SentenceTransformer("all-MiniLM-L6-v2")
-            vec = MemoryManager._st_model.encode(text, normalize_embeddings=True)
-            return vec.tolist()
-        except ImportError:
-            pass
-        except Exception as exc:
-            LOGGER.debug("sentence-transformers embed failed: %s", exc)
-
-        # Hash-based fallback
-        tokens = re.findall(r"[\w\u4e00-\u9fff]+", text.lower())
-        vec = [0.0] * dims
-        if not tokens:
-            return vec
-        for token in tokens:
-            h = hash(token)
-            idx = h % dims
-            sign = 1.0 if (h >> 1) & 1 else -1.0
-            vec[idx] += sign
-        norm = math.sqrt(sum(v * v for v in vec))
-        if norm <= 0.0:
-            return vec
-        return [v / norm for v in vec]
+        """Generate text embedding using shared utility."""
+        return embed_text(text, dims)
 
 
 

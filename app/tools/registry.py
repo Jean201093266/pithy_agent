@@ -277,23 +277,24 @@ class ToolRegistry:
 
     def list_tools(self) -> list[dict[str, Any]]:
         out = []
+        # Batch query all tool states to avoid N+1
+        tool_states = self.db.get_all_tool_states()
         for name, spec in self._builtin_tools.items():
             out.append({
                 "name": name,
                 "description": spec.description,
                 "risk_level": spec.risk_level,
-                "enabled": self.db.is_tool_enabled(name, default=True),
+                "enabled": tool_states.get(name, True),
                 "source": spec.source,
                 "inputSchema": spec.input_schema,
             })
         for name, manifest in self._custom_manifests.items():
-            # Inherit inputSchema from target builtin
             target_schema = self._builtin_tools.get(manifest.target_tool)
             out.append({
                 "name": name,
                 "description": manifest.description,
                 "risk_level": manifest.risk_level,
-                "enabled": self.db.is_tool_enabled(name, default=True),
+                "enabled": tool_states.get(name, True),
                 "source": "custom",
                 "inputSchema": target_schema.input_schema if target_schema else {},
             })
@@ -302,7 +303,7 @@ class ToolRegistry:
                 "name": tname,
                 "description": tdef.get("description", ""),
                 "risk_level": "normal",
-                "enabled": self.db.is_tool_enabled(tname, default=True),
+                "enabled": tool_states.get(tname, True),
                 "source": f"mcp:{server_id}",
                 "inputSchema": tdef.get("inputSchema", {"type": "object", "properties": {}}),
             })

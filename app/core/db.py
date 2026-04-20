@@ -3,22 +3,29 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
+
+from app.core.embeddings import cosine_similarity
 
 
 class AppDB:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        # Enable WAL mode for better concurrent read/write performance
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        """Return a thread-local persistent connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn = conn
         return conn
 
     def _init_schema(self) -> None:
@@ -271,32 +278,47 @@ class AppDB:
         top_k: int = 6,
         min_importance: float = 0.2,
     ) -> list[dict[str, Any]]:
-        items = self.list_memory_items(session_id=session_id, limit=800)
+        # Filter in SQL: only items with sufficient importance and non-empty embeddings
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, session_id, memory_type, text, payload_json, importance, embedding_json, access_count, "
+                "created_at, updated_at FROM memory_items "
+                "WHERE session_id = ? AND importance >= ? AND length(embedding_json) > 2 "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id or "default", min_importance, 800),
+            ).fetchall()
         scored: list[tuple[float, dict[str, Any]]] = []
-        for item in items:
-            if float(item.get("importance", 0.0)) < min_importance:
+        for row in rows:
+            emb_str = row["embedding_json"] or "[]"
+            try:
+                emb = json.loads(emb_str)
+            except (TypeError, ValueError):
                 continue
-            emb = item.get("embedding")
             if not isinstance(emb, list) or not emb:
                 continue
-            sim = self._cosine_similarity(query_embedding, [float(x) for x in emb])
-            recency_bonus = 1.0 / (1.0 + math.log1p(max(item.get("access_count", 0), 0)))
-            score = sim * 0.85 + float(item["importance"]) * 0.1 + recency_bonus * 0.05
+            item = {
+                "id": row["id"],
+                "session_id": row["session_id"],
+                "memory_type": row["memory_type"],
+                "text": row["text"],
+                "payload": json.loads(row["payload_json"] or "{}"),
+                "importance": float(row["importance"]),
+                "embedding": emb,
+                "access_count": int(row["access_count"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            sim = cosine_similarity(query_embedding, [float(x) for x in emb])
+            recency_bonus = 1.0 / (1.0 + math.log1p(max(item["access_count"], 0)))
+            score = sim * 0.85 + item["importance"] * 0.1 + recency_bonus * 0.05
             scored.append((score, item))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [item for _, item in scored[: max(1, min(top_k, 20))]]
 
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:
-        size = min(len(a), len(b))
-        if size == 0:
-            return 0.0
-        dot = sum(float(a[i]) * float(b[i]) for i in range(size))
-        norm_a = math.sqrt(sum(float(a[i]) * float(a[i]) for i in range(size)))
-        norm_b = math.sqrt(sum(float(b[i]) * float(b[i]) for i in range(size)))
-        if norm_a <= 0.0 or norm_b <= 0.0:
-            return 0.0
-        return dot / (norm_a * norm_b)
+        """Deprecated: use app.core.embeddings.cosine_similarity instead."""
+        return cosine_similarity(a, b)
 
     def set_tool_enabled(self, name: str, enabled: bool) -> None:
         with self.connect() as conn:
@@ -310,6 +332,12 @@ class AppDB:
         with self.connect() as conn:
             row = conn.execute("SELECT enabled FROM tool_state WHERE name = ?", (name,)).fetchone()
         return default if row is None else bool(row["enabled"])
+
+    def get_all_tool_states(self) -> dict[str, bool]:
+        """Batch query all tool enabled states. Returns {name: enabled}."""
+        with self.connect() as conn:
+            rows = conn.execute("SELECT name, enabled FROM tool_state").fetchall()
+        return {row["name"]: bool(row["enabled"]) for row in rows}
 
     def upsert_skill(self, name: str, version: str, spec: dict[str, Any], source: str = "api_save") -> int:
         serialized = json.dumps(spec, ensure_ascii=False)
