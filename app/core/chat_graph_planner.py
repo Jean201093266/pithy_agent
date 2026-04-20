@@ -275,8 +275,11 @@ class PlannerExecutorEngine:
                 user_message=message,
             )
             try:
+                # Use a longer timeout for the planner call
+                planner_cfg = ModelConfig(**{**cfg.__dict__})
+                planner_cfg.timeout_seconds = max(cfg.timeout_seconds, 60)
                 raw, usage = llm.call_with_usage(
-                    planner_prompt, cfg, context=None,
+                    planner_prompt, planner_cfg, context=None,
                     json_mode=True,  # structured output
                     system_prompt="You are a task planner. Always respond with valid JSON only.",
                 )

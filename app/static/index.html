@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260420a" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260420b" />
 </head>
 <body data-theme="system">
 
@@ -250,6 +250,10 @@
             <div class="form-item">
               <label class="label">Context Window</label>
               <input id="cfg-context-window" type="number" placeholder="8192" />
+            </div>
+            <div class="form-item">
+              <label class="label">Timeout (秒)</label>
+              <input id="cfg-timeout" type="number" min="10" max="300" placeholder="60" />
             </div>
           </div>
           <div class="btn-row">

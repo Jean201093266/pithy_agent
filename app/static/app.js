@@ -619,6 +619,8 @@ async function loadConfig() {
   document.getElementById('cfg-max-tokens').value = cfg.max_tokens;
   const cwEl = document.getElementById('cfg-context-window');
   if (cwEl) cwEl.value = cfg.context_window || 8192;
+  const toEl = document.getElementById('cfg-timeout');
+  if (toEl) toEl.value = cfg.timeout_seconds || 60;
 }
 
 async function loadTools() {
@@ -975,6 +977,7 @@ document.getElementById('send-btn').onclick = async () => {
 
       for (const part of parts) {
         const line = part.trim();
+        if (!line || line.startsWith(':')) continue; // skip empty lines and keepalive comments
         if (!line.startsWith('data:')) continue;
         let evt;
         try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
@@ -1221,7 +1224,7 @@ document.getElementById('save-cfg').onclick = async () => {
     temperature: Number(document.getElementById('cfg-temperature').value || 0.5),
     max_tokens: Number(document.getElementById('cfg-max-tokens').value || 2048),
     context_window: Number((document.getElementById('cfg-context-window') || {}).value || 8192),
-    timeout_seconds: 30,
+    timeout_seconds: Number((document.getElementById('cfg-timeout') || {}).value || 60),
   };
   try {
     await api('/api/config/model', { method: 'PUT', body: JSON.stringify(payload) });

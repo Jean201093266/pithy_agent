@@ -23,7 +23,7 @@ class ModelConfig:
     base_url: str = ""
     temperature: float = 0.5
     max_tokens: int = 2048
-    timeout_seconds: int = 30
+    timeout_seconds: int = 60
     context_window: int = 8192  # used for token budget calculation
 
 
@@ -112,7 +112,7 @@ class ConfigStore:
             base_url=data.get("base_url", ""),
             temperature=float(data.get("temperature", 0.5)),
             max_tokens=int(data.get("max_tokens", 2048)),
-            timeout_seconds=int(data.get("timeout_seconds", 30)),
+            timeout_seconds=int(data.get("timeout_seconds", 60)),
             context_window=int(data.get("context_window", 8192)),
         )
 

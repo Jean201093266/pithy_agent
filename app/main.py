@@ -799,6 +799,47 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
+def _sse_keepalive() -> str:
+    """SSE comment used as a keepalive to prevent connection timeout."""
+    return ": keepalive\n\n"
+
+
+def _stream_with_heartbeat(gen_func, *args, heartbeat_interval: float = 8.0, **kwargs):
+    """
+    Wrap a blocking generator so that SSE keepalive comments are yielded
+    while the generator is computing (no output for > heartbeat_interval seconds).
+    This prevents browsers / reverse-proxies from dropping the connection.
+    """
+    import queue, threading, time as _t
+
+    q: queue.Queue = queue.Queue()
+    sentinel = object()
+
+    def _producer():
+        try:
+            for item in gen_func(*args, **kwargs):
+                q.put(item)
+        except Exception as exc:
+            q.put(exc)
+        finally:
+            q.put(sentinel)
+
+    thread = threading.Thread(target=_producer, daemon=True)
+    thread.start()
+
+    while True:
+        try:
+            item = q.get(timeout=heartbeat_interval)
+        except queue.Empty:
+            yield _sse_keepalive()
+            continue
+        if item is sentinel:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
 @app.post("/api/chat/stream")
 def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
     _require_unlocked(request)
@@ -839,14 +880,23 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
             total_completion_tokens = 0
 
             try:
-                for evt in planner_executor_engine.stream_events(
-                    message=_safe_message,
-                    cfg=cfg,
-                    session_id=session_id,
-                    enabled_tools=enabled_tools,
-                    is_mock=is_mock,
-                    system_prompt=system_prompt,
-                ):
+                def _planner_sse_gen():
+                    for evt in planner_executor_engine.stream_events(
+                        message=_safe_message,
+                        cfg=cfg,
+                        session_id=session_id,
+                        enabled_tools=enabled_tools,
+                        is_mock=is_mock,
+                        system_prompt=system_prompt,
+                    ):
+                        yield evt
+
+                for evt_or_keepalive in _stream_with_heartbeat(_planner_sse_gen):
+                    if isinstance(evt_or_keepalive, str):
+                        # keepalive comment
+                        yield evt_or_keepalive
+                        continue
+                    evt = evt_or_keepalive
                     if evt.get("type") == "token":
                         final_reply += evt.get("text", "")
                     elif evt.get("type") == "step_done":
