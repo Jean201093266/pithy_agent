@@ -27,10 +27,7 @@ class ModelConfig:
     context_window: int = 8192  # used for token budget calculation
 
 
-_DEFAULT_SYSTEM_PROMPT = (
-    "You are a helpful local agent. "
-    "You answer questions clearly and concisely, and call tools when needed."
-)
+from app.core.prompts import DEFAULT_SYSTEM_PROMPT as _DEFAULT_SYSTEM_PROMPT
 
 
 @dataclass

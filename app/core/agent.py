@@ -12,34 +12,8 @@ from app.core.system_info import get_system_context_string
 
 LOGGER = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# ReAct system prompt template
-# ---------------------------------------------------------------------------
-_REACT_SYSTEM_TMPL = """\
-You are a helpful local agent that follows the ReAct (Reasoning + Acting) protocol strictly.
-
-Runtime environment: {system_context}
-
-Available tools:
-{tool_descriptions}
-
-Output format – repeat until you reach a final answer:
-Thought: <your reasoning>
-Action: <tool name, must be one of the available tools listed above>
-Action Input: <JSON object with the tool parameters>
-Observation: <tool result will be appended here by the system>
-
-When you have enough information to answer the user, output:
-Thought: <final reasoning>
-Final Answer: <your response to the user>
-
-Rules:
-- Always start with "Thought:".
-- "Action:" must be followed by exactly one tool name.
-- "Action Input:" must be a valid JSON object.
-- Do NOT fabricate Observations; wait for the system.
-- If no tool is needed, go straight to "Final Answer:".
-"""
+# ReAct system prompt template – centralised in prompts.py
+from app.core.prompts import REACT_SYSTEM_TMPL as _REACT_SYSTEM_TMPL
 
 
 def detect_language(text: str) -> str:
@@ -238,20 +212,10 @@ def parse_react_llm_output(text: str, available_tools: set[str] | None = None) -
     thought_match = re.search(r"(?i)^thought\s*:\s*(.+?)(?=\n(?:action|final answer)\s*:|$)", text, re.DOTALL | re.MULTILINE)
     thought = thought_match.group(1).strip() if thought_match else ""
 
-    # Check for Final Answer
-    final_match = re.search(r"(?i)final answer\s*:\s*(.+)", text, re.DOTALL)
-    if final_match:
-        return ReActDecision(
-            thought=thought,
-            action=None,
-            should_stop=True,
-            stop_reason="final_answer",
-            final_answer=final_match.group(1).strip(),
-        )
-
-    # Check for Action + Action Input
+    # Check for Action + Action Input (prioritize over Final Answer —
+    # LLMs often hallucinate Observation + Final Answer after Action)
     action_match = re.search(r"(?i)^action\s*:\s*(.+)$", text, re.MULTILINE)
-    action_input_match = re.search(r"(?i)^action input\s*:\s*(.+?)(?=\nthought\s*:|$)", text, re.DOTALL | re.MULTILINE)
+    action_input_match = re.search(r"(?i)^action input\s*:\s*(.+?)(?=\nobservation\s*:|$)", text, re.DOTALL | re.MULTILINE)
 
     if action_match:
         tool_name = action_match.group(1).strip()
@@ -283,6 +247,17 @@ def parse_react_llm_output(text: str, available_tools: set[str] | None = None) -
         return ReActDecision(
             thought=thought,
             action=AgentToolCall(name=tool_name, params=params, reason="llm_react"),
+        )
+
+    # Check for Final Answer (only if no Action was found)
+    final_match = re.search(r"(?i)final answer\s*:\s*(.+)", text, re.DOTALL)
+    if final_match:
+        return ReActDecision(
+            thought=thought,
+            action=None,
+            should_stop=True,
+            stop_reason="final_answer",
+            final_answer=final_match.group(1).strip(),
         )
 
     # LLM produced unstructured text — treat as final answer

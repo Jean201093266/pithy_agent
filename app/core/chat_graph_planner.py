@@ -49,67 +49,9 @@ except Exception:
     StateGraph = None
     _LANGGRAPH_OK = False
 
-# ---------------------------------------------------------------------------
-# Planner prompt
-# ---------------------------------------------------------------------------
-_PLANNER_PROMPT = """\
-You are a task planner. Analyze the user's request and decompose it into \
-a concise list of executable steps.
-
-Runtime environment: {system_context}
-Available tools: {tool_names}
-
-Output ONLY a JSON object in this exact format (no markdown, no explanation):
-{{
-  "reasoning": "<brief reasoning about the approach>",
-  "steps": [
-    {{
-      "index": 1,
-      "task": "<what to do in plain language>",
-      "type": "tool",
-      "tool": "<tool_name or null>",
-      "params": {{"<param>": "<value>"}}
-    }},
-    {{
-      "index": 2,
-      "task": "<what to do>",
-      "type": "llm",
-      "tool": null,
-      "params": {{}}
-    }}
-  ]
-}}
-
-Rules:
-- Use "type": "tool" only when a specific tool from the available list is needed.
-- Use "type": "llm" for reasoning, writing, or summarisation steps.
-- Keep steps minimal: 1-4 steps for most tasks.
-- If the task is a simple question that needs no tools, output a single "llm" step.
-- If memory context is provided below, consider it in your plan.
-- IMPORTANT: When generating file paths or shell commands, always use the correct \
-syntax for the runtime OS shown above. For example, use backslash paths on Windows \
-and forward-slash paths on Linux/macOS; use PowerShell/CMD commands on Windows and \
-bash/sh commands on Linux/macOS.
-
-Memory context: {memory_context}
-
-User request: {user_message}
-"""
-
-# ---------------------------------------------------------------------------
-# Synthesizer prompt
-# ---------------------------------------------------------------------------
-_SYNTHESIZE_PROMPT = """\
-Based on the following execution trace, write a clear and helpful final \
-answer to the user.
-
-User request: {user_message}
-Memory context: {memory_context}
-
-Execution trace:
-{trace}
-
-Final answer:"""
+# Prompts – centralised in prompts.py
+from app.core.prompts import PLANNER_PROMPT as _PLANNER_PROMPT
+from app.core.prompts import SYNTHESIZE_PROMPT as _SYNTHESIZE_PROMPT
 
 
 def _parse_plan(raw: str) -> dict[str, Any]:

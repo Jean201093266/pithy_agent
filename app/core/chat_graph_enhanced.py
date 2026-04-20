@@ -108,7 +108,8 @@ class ChatGraphWithEnhancedMemory:
 
         # Inject hierarchical memory into system prompt
         if memory_prompt:
-            system_prompt = f"{system_prompt}\n\n【上下文记忆】\n{memory_prompt}"
+            from app.core.prompts import MEMORY_CONTEXT_INJECTION
+            system_prompt = system_prompt + MEMORY_CONTEXT_INJECTION.format(memory_prompt=memory_prompt)
 
         # Build scratchpad from state
         react_trace = state.get("react_trace", [])
