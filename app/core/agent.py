@@ -8,6 +8,8 @@ from typing import Any
 
 from langdetect import detect
 
+from app.core.system_info import get_system_context_string
+
 LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -15,6 +17,8 @@ LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _REACT_SYSTEM_TMPL = """\
 You are a helpful local agent that follows the ReAct (Reasoning + Acting) protocol strictly.
+
+Runtime environment: {system_context}
 
 Available tools:
 {tool_descriptions}
@@ -105,7 +109,10 @@ def build_react_system_prompt(tools: list[dict[str, Any]]) -> str:
         tool_descriptions = "\n".join(lines)
     else:
         tool_descriptions = "(no tools available)"
-    return _REACT_SYSTEM_TMPL.format(tool_descriptions=tool_descriptions)
+    return _REACT_SYSTEM_TMPL.format(
+        tool_descriptions=tool_descriptions,
+        system_context=get_system_context_string(),
+    )
 
 
 def build_react_scratchpad(message: str, trace: list[dict[str, Any]]) -> str:

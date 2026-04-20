@@ -33,6 +33,7 @@ from app.core.config_store import ModelConfig
 from app.core.langchain_adapter import LangChainAdapter
 from app.core.memory import MemoryManager
 from app.core.llm_errors import LLMProviderError
+from app.core.system_info import get_system_context_string
 
 LOGGER = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ _PLANNER_PROMPT = """\
 You are a task planner. Analyze the user's request and decompose it into \
 a concise list of executable steps.
 
+Runtime environment: {system_context}
 Available tools: {tool_names}
 
 Output ONLY a JSON object in this exact format (no markdown, no explanation):
@@ -83,6 +85,10 @@ Rules:
 - Keep steps minimal: 1-4 steps for most tasks.
 - If the task is a simple question that needs no tools, output a single "llm" step.
 - If memory context is provided below, consider it in your plan.
+- IMPORTANT: When generating file paths or shell commands, always use the correct \
+syntax for the runtime OS shown above. For example, use backslash paths on Windows \
+and forward-slash paths on Linux/macOS; use PowerShell/CMD commands on Windows and \
+bash/sh commands on Linux/macOS.
 
 Memory context: {memory_context}
 
@@ -273,6 +279,7 @@ class PlannerExecutorEngine:
                 tool_names=tool_names,
                 memory_context=memory_prompt[:400],
                 user_message=message,
+                system_context=get_system_context_string(),
             )
             try:
                 # Use a longer timeout for the planner call
@@ -384,6 +391,7 @@ class PlannerExecutorEngine:
                         f"Step {i+1}: {o[:400]}" for i, o in enumerate(step_outputs)
                     ) if step_outputs else ""
                     step_prompt = (
+                        f"Runtime environment: {get_system_context_string()}\n"
                         f"User request: {message}\n"
                         + (f"Memory: {memory_prompt[:300]}\n" if memory_prompt else "")
                         + (f"Prior results:\n{prior_context}\n\n" if prior_context else "")
