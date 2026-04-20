@@ -164,6 +164,7 @@ class PlannerExecutorEngine:
         session_id: str,
         enabled_tools: list[dict[str, Any]],
         is_mock: bool = False,
+        system_prompt: str = "",
     ) -> dict[str, Any]:
         """Synchronous invoke – used by the non-streaming /api/chat endpoint."""
         if self._graph is None:
@@ -171,6 +172,7 @@ class PlannerExecutorEngine:
         return self._graph.invoke(self._initial_state(
             message=message, cfg=cfg, session_id=session_id,
             enabled_tools=enabled_tools, is_mock=is_mock,
+            system_prompt=system_prompt,
         ))
 
     def stream_events(
@@ -181,6 +183,7 @@ class PlannerExecutorEngine:
         session_id: str,
         enabled_tools: list[dict[str, Any]],
         is_mock: bool = False,
+        system_prompt: str = "",
     ) -> Generator[dict[str, Any], None, None]:
         """
         Yield typed event dicts suitable for SSE serialisation.
@@ -201,6 +204,7 @@ class PlannerExecutorEngine:
         init = self._initial_state(
             message=message, cfg=cfg, session_id=session_id,
             enabled_tools=enabled_tools, is_mock=is_mock,
+            system_prompt=system_prompt,
         )
 
         try:
@@ -264,14 +268,18 @@ class PlannerExecutorEngine:
                 "steps": [{"index": 1, "task": message, "type": "llm", "tool": None, "params": {}}],
             }
         else:
-            llm = self.adapter.llm_runnable()
+            llm = self.adapter.llm_client
             planner_prompt = _PLANNER_PROMPT.format(
                 tool_names=tool_names,
                 memory_context=memory_prompt[:400],
                 user_message=message,
             )
             try:
-                raw = llm.invoke({"prompt": planner_prompt, "cfg": cfg, "context": None})
+                raw, _ = llm.call_with_usage(
+                    planner_prompt, cfg, context=None,
+                    json_mode=True,  # structured output
+                    system_prompt="You are a task planner. Always respond with valid JSON only.",
+                )
                 plan_data = _parse_plan(str(raw))
             except Exception as exc:
                 LOGGER.warning("Planner LLM failed: %s – using single-step fallback", exc)
@@ -310,7 +318,7 @@ class PlannerExecutorEngine:
         step_outputs: list[str]       = []
         executed_results: list[dict]  = []
         react_trace: list[dict]       = []
-        llm = self.adapter.llm_runnable()
+        llm = self.adapter.llm_client
 
         for step in steps:
             idx      = int(step.get("index", len(step_outputs) + 1))
@@ -328,14 +336,25 @@ class PlannerExecutorEngine:
                     )
                     s_params = {"input": context_summary}
 
-                try:
-                    result = self.adapter.execute_tool(tool_nm, {k: str(v) for k, v in s_params.items()})
-                    output = json.dumps(result, ensure_ascii=False)[:2000]
-                    error  = None
-                except Exception as exc:
-                    output = f"[tool error] {exc}"
-                    result = {"error": str(exc)}
-                    error  = str(exc)
+                # Retry failed tool steps once
+                max_tool_retries = 2
+                result = None
+                error = None
+                output = ""
+                for attempt in range(max_tool_retries):
+                    try:
+                        result = self.adapter.execute_tool(tool_nm, {k: str(v) for k, v in s_params.items()})
+                        output = json.dumps(result, ensure_ascii=False)[:2000]
+                        error = None
+                        break
+                    except Exception as exc:
+                        error = str(exc)
+                        output = f"[tool error attempt {attempt+1}] {exc}"
+                        result = {"error": str(exc)}
+                        if attempt < max_tool_retries - 1:
+                            import time as _time
+                            _time.sleep(0.5)
+                            LOGGER.warning("Tool %s step %d attempt %d failed: %s – retrying", tool_nm, idx, attempt+1, exc)
 
                 executed_results.append({
                     "step": idx, "tool": tool_nm,
@@ -364,7 +383,10 @@ class PlannerExecutorEngine:
                         + f"Current task: {task}"
                     )
                     try:
-                        output = str(llm.invoke({"prompt": step_prompt, "cfg": cfg, "context": None}))
+                        output = str(llm.call_with_usage(
+                            step_prompt, cfg, context=None,
+                            system_prompt=state.get("system_prompt"),
+                        )[0])
                     except LLMProviderError:
                         raise
                     except Exception as exc:
@@ -409,9 +431,12 @@ class PlannerExecutorEngine:
                     memory_context=memory_prompt[:300] or "none",
                     trace=trace_text,
                 )
-                llm = self.adapter.llm_runnable()
+                llm = self.adapter.llm_client
                 try:
-                    final = str(llm.invoke({"prompt": synth_prompt, "cfg": cfg, "context": None}))
+                    final = str(llm.call_with_usage(
+                        synth_prompt, cfg, context=None,
+                        system_prompt=state.get("system_prompt"),
+                    )[0])
                 except LLMProviderError:
                     raise
                 except Exception as exc:
@@ -450,6 +475,7 @@ class PlannerExecutorEngine:
         session_id: str,
         enabled_tools: list[dict[str, Any]],
         is_mock: bool,
+        system_prompt: str = "",
     ) -> dict[str, Any]:
         return {
             "message": message,
@@ -457,6 +483,7 @@ class PlannerExecutorEngine:
             "session_id": session_id,
             "enabled_tools": enabled_tools,
             "is_mock": is_mock,
+            "system_prompt": system_prompt,
             "memory_ctx": {},
             "memory_prompt": "",
             "plan": [],

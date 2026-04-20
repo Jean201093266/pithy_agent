@@ -22,8 +22,15 @@ class ModelConfig:
     secret_key: str = ""
     base_url: str = ""
     temperature: float = 0.5
-    max_tokens: int = 512
+    max_tokens: int = 2048
     timeout_seconds: int = 30
+    context_window: int = 8192  # used for token budget calculation
+
+
+_DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful local agent. "
+    "You answer questions clearly and concisely, and call tools when needed."
+)
 
 
 @dataclass
@@ -34,6 +41,7 @@ class AppSettings:
     log_level: str = "INFO"
     auto_refresh_logs: bool = False
     send_shortcut: str = "Ctrl+Enter"
+    system_prompt: str = _DEFAULT_SYSTEM_PROMPT
 
 
 class ConfigStore:
@@ -97,8 +105,9 @@ class ConfigStore:
             secret_key=secret_key,
             base_url=data.get("base_url", ""),
             temperature=float(data.get("temperature", 0.5)),
-            max_tokens=int(data.get("max_tokens", 512)),
+            max_tokens=int(data.get("max_tokens", 2048)),
             timeout_seconds=int(data.get("timeout_seconds", 30)),
+            context_window=int(data.get("context_window", 8192)),
         )
 
     def save_model_config(self, model_cfg: ModelConfig) -> None:
@@ -127,6 +136,7 @@ class ConfigStore:
             log_level=str(data.get("log_level", "INFO")).upper(),
             auto_refresh_logs=bool(data.get("auto_refresh_logs", False)),
             send_shortcut=str(data.get("send_shortcut", "Ctrl+Enter")),
+            system_prompt=str(data.get("system_prompt", _DEFAULT_SYSTEM_PROMPT)) or _DEFAULT_SYSTEM_PROMPT,
         )
 
     def save_app_settings(self, settings: AppSettings) -> None:

@@ -194,6 +194,45 @@ function relativeTime(dateStr) {
   } catch { return ''; }
 }
 
+function _makeActionBar(role, text) {
+  const bar = document.createElement('div');
+  bar.className = 'msg-action-bar';
+
+  // Copy button (all roles)
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'msg-action-btn';
+  copyBtn.title = '复制';
+  copyBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+  copyBtn.onclick = () => {
+    navigator.clipboard && navigator.clipboard.writeText(text).then(() => {
+      copyBtn.innerHTML = '✓';
+      setTimeout(() => {
+        copyBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+      }, 1500);
+    });
+  };
+  bar.appendChild(copyBtn);
+
+  // Retry button (user messages only)
+  if (role === 'user') {
+    const retryBtn = document.createElement('button');
+    retryBtn.className = 'msg-action-btn';
+    retryBtn.title = '重新发送';
+    retryBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.51"/></svg>';
+    retryBtn.onclick = () => {
+      const input = document.getElementById('chat-input');
+      if (!input) return;
+      input.value = text;
+      autoResizeTextarea(input);
+      updateCharCounter(input);
+      input.focus();
+    };
+    bar.appendChild(retryBtn);
+  }
+
+  return bar;
+}
+
 function appendLine(role, text) {
   // Remove empty-state placeholder on first message
   const empty = chatLog.querySelector('.chat-empty');
@@ -220,11 +259,13 @@ function appendLine(role, text) {
     wrap.appendChild(avatar);
     wrap.appendChild(bubble);
     row.appendChild(wrap);
+    row.appendChild(_makeActionBar('assistant', text));
   } else if (role === 'user') {
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble';
     bubble.textContent = text;
     row.appendChild(bubble);
+    row.appendChild(_makeActionBar('user', text));
   } else {
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble';
@@ -351,6 +392,8 @@ function syncSettingsForm() {
   document.getElementById('pref-log-level').value = state.settings.log_level;
   document.getElementById('pref-auto-refresh-logs').checked = state.settings.auto_refresh_logs;
   document.getElementById('pref-send-shortcut').value = state.settings.send_shortcut;
+  const sysEl = document.getElementById('pref-system-prompt');
+  if (sysEl) sysEl.value = state.settings.system_prompt || '';
 }
 
 function updateLockUI() {
@@ -574,6 +617,8 @@ async function loadConfig() {
   document.getElementById('cfg-secret-key').value = '';
   document.getElementById('cfg-temperature').value = cfg.temperature;
   document.getElementById('cfg-max-tokens').value = cfg.max_tokens;
+  const cwEl = document.getElementById('cfg-context-window');
+  if (cwEl) cwEl.value = cfg.context_window || 8192;
 }
 
 async function loadTools() {
@@ -1008,6 +1053,9 @@ document.getElementById('send-btn').onclick = async () => {
             chatLog.appendChild(aiRow);
           }
           enhanceCodeBlocks(aiBubble);
+          // Add action bar
+          const aiActionBar = _makeActionBar('assistant', fullText);
+          aiRow.appendChild(aiActionBar);
           const timeEl = document.createElement('span');
           timeEl.className = 'msg-time';
           timeEl.textContent = formatTime(new Date());
@@ -1112,6 +1160,20 @@ document.querySelectorAll('.chip[data-msg]').forEach(chip => {
 
 document.getElementById('refresh-history').onclick = () => refreshHistory().catch(e => showError(e.message));
 
+document.getElementById('export-session-btn') && (document.getElementById('export-session-btn').onclick = async () => {
+  if (!state.currentSessionId) { showToast('请先选择一个会话', 'error'); return; }
+  try {
+    const fmt = 'markdown';
+    const res = await api(`/api/sessions/${encodeURIComponent(state.currentSessionId)}/export?format=${fmt}`);
+    const blob = new Blob([res.content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = res.filename; a.click();
+    URL.revokeObjectURL(url);
+    showToast(`已导出 ${res.filename}`, 'success');
+  } catch (e) { showToast(e.message, 'error'); }
+});
+
 document.getElementById('save-settings').onclick = async () => {
   try {
     const payload = {
@@ -1121,16 +1183,33 @@ document.getElementById('save-settings').onclick = async () => {
       log_level: document.getElementById('pref-log-level').value,
       auto_refresh_logs: document.getElementById('pref-auto-refresh-logs').checked,
       send_shortcut: document.getElementById('pref-send-shortcut').value || 'Ctrl+Enter',
+      system_prompt: (document.getElementById('pref-system-prompt') || {}).value || '',
     };
     state.settings = await api('/api/settings', { method: 'PUT', body: JSON.stringify(payload) });
     applyTheme(state.settings.theme);
     applyTranslations();
     scheduleLogRefresh();
+    showToast(t('saveSuccess'), 'success');
     setSkillResult(t('saveSuccess'));
   } catch (e) {
     setSkillResult(e.message);
   }
 };
+
+document.getElementById('save-system-prompt') && (document.getElementById('save-system-prompt').onclick = async () => {
+  try {
+    const sysPEl = document.getElementById('pref-system-prompt');
+    if (!sysPEl) return;
+    const payload = {
+      ...(state.settings || {}),
+      system_prompt: sysPEl.value || '',
+    };
+    state.settings = await api('/api/settings', { method: 'PUT', body: JSON.stringify(payload) });
+    showToast('系统提示词已保存', 'success');
+  } catch (e) {
+    showToast(e.message, 'error');
+  }
+});
 
 document.getElementById('save-cfg').onclick = async () => {
   const payload = {
@@ -1140,7 +1219,8 @@ document.getElementById('save-cfg').onclick = async () => {
     api_key: document.getElementById('cfg-api-key').value,
     secret_key: document.getElementById('cfg-secret-key').value,
     temperature: Number(document.getElementById('cfg-temperature').value || 0.5),
-    max_tokens: Number(document.getElementById('cfg-max-tokens').value || 512),
+    max_tokens: Number(document.getElementById('cfg-max-tokens').value || 2048),
+    context_window: Number((document.getElementById('cfg-context-window') || {}).value || 8192),
     timeout_seconds: 30,
   };
   try {

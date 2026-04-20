@@ -32,10 +32,18 @@ from app.core.memory_enhanced import (
 @pytest.fixture
 def temp_db():
     """Create a temporary database for testing."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "test.db"
-        db = AppDB(db_path)
-        yield db
+    tmpdir = tempfile.mkdtemp()
+    db_path = Path(tmpdir) / "test.db"
+    db = AppDB(db_path)
+    yield db
+    # Force close any lingering SQLite connections before cleanup
+    import gc
+    gc.collect()
+    try:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception:
+        pass
 
 
 @pytest.fixture
@@ -82,7 +90,7 @@ class TestMemoryScore:
             "consistency": 0,
         }
         custom_score = score.composite(custom_weights)
-        assert 0.79 <= custom_score <= 0.81  # ~0.8
+        assert 0.84 <= custom_score <= 0.86  # 0.8*0.5 + 0.9*0.5 = 0.85
 
 
 class TestMemoryRanker:

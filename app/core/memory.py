@@ -19,9 +19,10 @@ class MemoryConfig:
 class MemoryManager:
     """Coordinates short-term and long-term memory for a chat session."""
 
-    def __init__(self, db: AppDB, config: MemoryConfig | None = None) -> None:
+    def __init__(self, db: AppDB, config: MemoryConfig | None = None, llm_client: Any = None) -> None:
         self.db = db
         self.config = config or MemoryConfig()
+        self._llm_client = llm_client  # Optional: for real embeddings
 
     def retrieve_context(self, message: str, session_id: str = "default") -> dict[str, Any]:
         short_term = self._build_short_term_context(session_id=session_id)
@@ -211,6 +212,15 @@ class MemoryManager:
         return facts
 
     def _embed_text(self, text: str, dims: int = 64) -> list[float]:
+        # Use LLMClient.embed() if available (sentence-transformers or API)
+        if self._llm_client is not None:
+            try:
+                from app.core.config_store import ModelConfig
+                cfg = ModelConfig()  # minimal config for local embedding
+                return self._llm_client.embed(text, cfg)
+            except Exception:
+                pass
+        # Fallback: hash-based pseudo-embedding
         tokens = re.findall(r"[\w\u4e00-\u9fff]+", text.lower())
         vec = [0.0] * dims
         if not tokens:

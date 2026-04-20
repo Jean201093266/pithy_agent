@@ -30,7 +30,9 @@ from app.core.llm import LLMClient
 from app.core.llm_errors import LLMProviderError
 from app.core.chat_graph import ChatGraphEngine
 from app.core.memory import MemoryManager
+from app.core.memory_enhanced import EnhancedMemoryManager, EnhancedMemoryConfig
 from app.core.chat_graph_planner import PlannerExecutorEngine
+from app.core.input_guard import InputGuard
 from app.schemas import (
     ChatRequest,
     ChatResponse,
@@ -90,18 +92,70 @@ logging.basicConfig(
 app = FastAPI(title="Pithy Local Agent", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost",
+        "http://localhost:8000",
+        "http://localhost:3000",
+        "http://127.0.0.1",
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1:3000",
+        "app://.",  # Electron origin
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+try:
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = limiter
+
+    @app.exception_handler(RateLimitExceeded)
+    async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+        return _JSONResponse(status_code=429, content={"detail": "请求过于频繁，请稍后再试。"})
+except ImportError:
+    limiter = None
+
+# ---------------------------------------------------------------------------
+# Security headers middleware
+# ---------------------------------------------------------------------------
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response as _StarletteResponse
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response: _StarletteResponse = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+            "style-src 'self' https://cdn.jsdelivr.net https://fonts.googleapis.com 'unsafe-inline'; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data:; "
+            "connect-src 'self'"
+        )
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 app.mount("/static", StaticFiles(directory=ROOT / "app" / "static"), name="static")
 
 db = AppDB(DATA_DIR / "agent.db")
 config_store = ConfigStore(db, DATA_DIR / "secret.key")
 llm_client = LLMClient()
-memory_manager = MemoryManager(db)
+memory_manager = EnhancedMemoryManager(db)
 tool_registry = ToolRegistry(db)
 langchain_adapter = LangChainAdapter(llm_client, tool_registry)
 chat_graph_engine = ChatGraphEngine(langchain_adapter, memory_manager)
@@ -112,7 +166,11 @@ AUTH_STATE: dict[str, Any] = {
     "locked": config_store.has_unlock_password(),
     "token": None,
     "failed_attempts": 0,
+    "lockout_until": 0.0,  # Unix timestamp
+    "token_issued_at": 0.0,  # Unix timestamp
 }
+
+_TOKEN_MAX_AGE_SECONDS = 86400  # 24 hours
 
 
 def _is_unlocked(request: Request | None = None) -> bool:
@@ -121,6 +179,13 @@ def _is_unlocked(request: Request | None = None) -> bool:
     if AUTH_STATE["locked"]:
         return False
     if request is None:
+        return False
+    # Check token expiration
+    import time as _t
+    issued_at = AUTH_STATE.get("token_issued_at", 0.0)
+    if issued_at and (_t.time() - issued_at) > _TOKEN_MAX_AGE_SECONDS:
+        AUTH_STATE["locked"] = True
+        AUTH_STATE["token"] = None
         return False
     return request.headers.get("X-Session-Token") == AUTH_STATE["token"]
 
@@ -153,11 +218,18 @@ def web_root() -> FileResponse:
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     vm = psutil.virtual_memory()
+    # Use COUNT query instead of fetching rows
+    try:
+        with db.connect() as conn:
+            row = conn.execute("SELECT COUNT(*) as cnt FROM conversations").fetchone()
+            msg_count = int(row["cnt"]) if row else 0
+    except Exception:
+        msg_count = -1
     return {
         "status": "ok",
         "cpu_percent": psutil.cpu_percent(interval=0.1),
         "memory_percent": vm.percent,
-        "message_count": len(db.list_messages(limit=1000)),
+        "message_count": msg_count,
     }
 
 
@@ -207,6 +279,7 @@ def security_status() -> SecurityStatusResponse:
 
 @app.post("/api/security/setup", response_model=AuthSessionResponse)
 def security_setup(payload: PasswordSetupRequest) -> AuthSessionResponse:
+    import time as _t
     if config_store.has_unlock_password():
         raise HTTPException(status_code=400, detail="startup password already configured")
     config_store.set_unlock_password(payload.password)
@@ -214,25 +287,40 @@ def security_setup(payload: PasswordSetupRequest) -> AuthSessionResponse:
     AUTH_STATE["token"] = token
     AUTH_STATE["locked"] = False
     AUTH_STATE["failed_attempts"] = 0
+    AUTH_STATE["token_issued_at"] = _t.time()
     _audit("password_setup")
     return AuthSessionResponse(ok=True, token=token, has_password=True, locked=False, failed_attempts=0)
 
 
 @app.post("/api/security/unlock", response_model=AuthSessionResponse)
-def unlock(payload: UnlockRequest) -> AuthSessionResponse:
+def unlock(payload: UnlockRequest, request: Request) -> AuthSessionResponse:
+    import time as _t
+
+    # Check lockout
+    if AUTH_STATE.get("lockout_until", 0) and _t.time() < AUTH_STATE.get("lockout_until", 0):
+        remaining = int(AUTH_STATE["lockout_until"] - _t.time())
+        raise HTTPException(status_code=429, detail=f"账户已锁定，请 {remaining} 秒后重试")
+
     if not config_store.has_unlock_password():
         token = secrets.token_urlsafe(24)
         AUTH_STATE["token"] = token
         AUTH_STATE["locked"] = False
+        AUTH_STATE["token_issued_at"] = _t.time()
         return AuthSessionResponse(ok=True, token=token, has_password=False, locked=False, failed_attempts=0)
     if not config_store.verify_unlock_password(payload.password):
         AUTH_STATE["failed_attempts"] = int(AUTH_STATE["failed_attempts"]) + 1
         _audit("unlock_failed", f"attempts={AUTH_STATE['failed_attempts']}")
+        # Lockout after 5 failed attempts (60 seconds)
+        if AUTH_STATE["failed_attempts"] >= 5:
+            AUTH_STATE["lockout_until"] = _t.time() + 60
+            _audit("account_lockout", f"locked for 60s after {AUTH_STATE['failed_attempts']} attempts")
         raise HTTPException(status_code=401, detail="invalid password")
     token = secrets.token_urlsafe(24)
     AUTH_STATE["token"] = token
     AUTH_STATE["locked"] = False
     AUTH_STATE["failed_attempts"] = 0
+    AUTH_STATE["lockout_until"] = 0.0
+    AUTH_STATE["token_issued_at"] = _t.time()
     _audit("unlock_success")
     return AuthSessionResponse(ok=True, token=token, has_password=True, locked=False, failed_attempts=0)
 
@@ -265,6 +353,9 @@ def save_app_settings(payload: AppSettingsIn, request: Request) -> AppSettingsOu
     _require_unlocked(request)
     settings = AppSettings(**payload.model_dump())
     settings.log_level = settings.log_level.upper()
+    if not settings.system_prompt.strip():
+        from app.core.config_store import _DEFAULT_SYSTEM_PROMPT
+        settings.system_prompt = _DEFAULT_SYSTEM_PROMPT
     config_store.save_app_settings(settings)
     _audit("settings_updated", f"theme={settings.theme} language={settings.language}")
     return AppSettingsOut(**settings.__dict__)
@@ -299,6 +390,7 @@ def save_model_config(payload: ModelConfigIn, request: Request) -> ModelConfigOu
         temperature=cfg.temperature,
         max_tokens=cfg.max_tokens,
         timeout_seconds=cfg.timeout_seconds,
+        context_window=cfg.context_window,
         has_api_key=bool(cfg.api_key),
         has_secret_key=bool(cfg.secret_key),
     )
@@ -469,6 +561,12 @@ def delete_mcp_server(server_id: str, request: Request) -> MCPServerDeleteRespon
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     _require_unlocked(request)
+
+    # ── Input guard ──────────────────────────────────────────────────────
+    guard = InputGuard.check(payload.message)
+    if guard.blocked:
+        raise HTTPException(status_code=400, detail={"code": "INPUT_BLOCKED", "message": guard.reason})
+    payload = ChatRequest(**{**payload.model_dump(), "message": guard.sanitised or payload.message})
     raw_session_id = (payload.session_id or "").strip()
     session_id = raw_session_id
     if not session_id:
@@ -560,6 +658,8 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     memory_prompt = str(memory_ctx.get("memory_prompt") or "").strip()
 
     MAX_STEPS = 6
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
 
     # ------------------------------------------------------------------ #
     # If a force_tool is specified, honour it immediately (first step)     #
@@ -593,11 +693,13 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
             question = payload.message if not memory_prompt else f"{payload.message}\n\n[Memory Context]\n{memory_prompt}"
             scratchpad = build_react_scratchpad(question, react_trace)
             try:
-                raw_output = llm_client.call(
+                raw_output, usage = llm_client.call_with_usage(
                     scratchpad,
                     cfg,
                     context=[{"role": "system", "content": system_prompt}],
                 )
+                total_prompt_tokens += usage.prompt_tokens
+                total_completion_tokens += usage.completion_tokens
             except LLMProviderError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
 
@@ -669,12 +771,30 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
             raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
 
     db.add_message("assistant", final_reply, session_id=session_id)
+    # Sanitize output to prevent XSS
+    final_reply = InputGuard.sanitize_output(final_reply)
     memory_update = memory_manager.update_after_turn(
         user_message=payload.message,
         assistant_reply=final_reply,
         session_id=session_id,
         tool_trace=executed_results,
     )
+
+    # Record token usage for non-streaming path
+    if total_prompt_tokens or total_completion_tokens:
+        try:
+            import secrets as _secrets2
+            db.record_token_usage(
+                session_id=session_id,
+                trace_id=_secrets2.token_hex(8),
+                provider=cfg.provider or "unknown",
+                model=cfg.model or "unknown",
+                prompt_tokens=total_prompt_tokens,
+                completion_tokens=total_completion_tokens,
+                total_tokens=total_prompt_tokens + total_completion_tokens,
+            )
+        except Exception as _te:
+            APP_LOGGER.warning("token usage record failed (non-stream): %s", _te)
 
     # Build a lightweight plan_exec dict for response compatibility
     plan_exec = build_light_plan_exec(payload.message)
@@ -743,6 +863,13 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
     def generate():
         import secrets as _secrets, time as _time
 
+        # ── Input guard ───────────────────────────────────────────────
+        _guard = InputGuard.check(payload.message)
+        if _guard.blocked:
+            yield _sse({"type": "error", "message": _guard.reason})
+            return
+        _safe_message = _guard.sanitised or payload.message
+
         raw_session_id = (payload.session_id or "").strip()
         session_id = raw_session_id
         if not session_id:
@@ -757,9 +884,11 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
         trace_id = _secrets.token_hex(8)
         yield _sse({"type": "trace", "trace_id": trace_id})
 
-        language = detect_language(payload.message)
+        language = detect_language(_safe_message)
         cfg = config_store.get_model_config()
         is_mock = (cfg.provider or "mock").lower() == "mock"
+        settings = config_store.get_app_settings()
+        system_prompt = settings.system_prompt
 
         all_tools = tool_registry.list_tools()
         enabled_tools = [t for t in all_tools if t.get("enabled", True)]
@@ -776,11 +905,12 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
 
             try:
                 for evt in planner_executor_engine.stream_events(
-                    message=payload.message,
+                    message=_safe_message,
                     cfg=cfg,
                     session_id=session_id,
                     enabled_tools=enabled_tools,
                     is_mock=is_mock,
+                    system_prompt=system_prompt,
                 ):
                     if evt.get("type") == "token":
                         final_reply += evt.get("text", "")
@@ -808,8 +938,8 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
 
             # memory retrieval
             yield _sse({"type": "step", "step": "memory", "detail": "正在检索记忆上下文…"})
-            db.add_message("user", payload.message, session_id=session_id)
-            memory_ctx = memory_manager.retrieve_context(payload.message, session_id=session_id)
+            db.add_message("user", _safe_message, session_id=session_id)
+            memory_ctx = memory_manager.retrieve_context(_safe_message, session_id=session_id)
             memory_prompt = str(memory_ctx.get("memory_prompt") or "").strip()
             long_term_count = len(memory_ctx.get("long_term") or [])
             if long_term_count:
@@ -832,7 +962,7 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
 
             # ReAct loop
             if not is_mock:
-                system_prompt = build_react_system_prompt(enabled_tools)
+                react_system_prompt = build_react_system_prompt(enabled_tools)
                 yield _sse({"type": "step", "step": "think", "detail": "开始推理…"})
 
                 for _step in range(MAX_STEPS):
@@ -841,7 +971,8 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
                     try:
                         raw_output, usage = llm_client.call_with_usage(
                             scratchpad, cfg,
-                            context=[{"role": "system", "content": system_prompt}],
+                            context=[{"role": "system", "content": react_system_prompt}],
+                            system_prompt=system_prompt,
                         )
                         total_prompt_tokens += usage.prompt_tokens
                         total_completion_tokens += usage.completion_tokens
@@ -884,14 +1015,14 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
             if not final_reply:
                 if executed_results:
                     summary_prompt = (
-                        f"用户输入: {payload.message}\n"
+                        f"用户输入: {_safe_message}\n"
                         f"记忆上下文: {memory_prompt or '无'}\n"
                         f"ReAct轨迹: {json.dumps(react_trace, ensure_ascii=False)}\n"
                         f"工具执行结果: {json.dumps(executed_results, ensure_ascii=False)}\n"
                         f"请根据以上信息给出最终回答。"
                     )
                 else:
-                    summary_prompt = payload.message if not memory_prompt else f"{payload.message}\n\n参考记忆:\n{memory_prompt}"
+                    summary_prompt = _safe_message if not memory_prompt else f"{_safe_message}\n\n参考记忆:\n{memory_prompt}"
 
                 context_messages = memory_ctx.get("context_messages") or db.list_messages(limit=20, session_id=session_id)
                 tokens: list[str] = []
@@ -911,7 +1042,7 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
             # Persist & memory update (legacy path only – planner handles this internally)
             db.add_message("assistant", final_reply, session_id=session_id)
             memory_manager.update_after_turn(
-                user_message=payload.message,
+                user_message=_safe_message,
                 assistant_reply=final_reply,
                 session_id=session_id,
                 tool_trace=executed_results,
@@ -1028,7 +1159,26 @@ def global_token_stats(request: Request) -> dict[str, Any]:
 
 
 
-@app.get("/api/history")
+@app.get("/api/sessions/{session_id}/export")
+def export_session(session_id: str, request: Request, format: str = "markdown") -> dict[str, Any]:
+    """Export conversation as markdown or JSON."""
+    _require_unlocked(request)
+    sessions = {s["session_id"] for s in db.list_sessions()}
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    messages = db.list_messages(limit=500, session_id=session_id)
+    if format == "json":
+        content = json.dumps(messages, ensure_ascii=False, indent=2)
+        filename = f"session-{session_id[:8]}.json"
+    else:
+        lines = [f"# 对话记录\n\n**会话 ID**: `{session_id}`\n"]
+        for m in messages:
+            role_label = "**用户**" if m["role"] == "user" else "**AI**"
+            ts = m.get("created_at", "")
+            lines.append(f"\n---\n{role_label} · {ts}\n\n{m['content']}\n")
+        content = "\n".join(lines)
+        filename = f"session-{session_id[:8]}.md"
+    return {"content": content, "filename": filename, "format": format}
 def history(request: Request, session_id: str = Query(default="")) -> list[dict[str, Any]]:
     _require_unlocked(request)
     sid = (session_id or "").strip()

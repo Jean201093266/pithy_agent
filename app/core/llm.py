@@ -36,12 +36,14 @@ class TokenUsage:
 
 class LLMClient:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=5), reraise=True)
-    def call(self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None) -> str:
-        reply, _ = self.call_with_usage(prompt, cfg, context)
+    def call(self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None,
+             system_prompt: str | None = None) -> str:
+        reply, _ = self.call_with_usage(prompt, cfg, context, system_prompt=system_prompt)
         return reply
 
     def call_with_usage(
-        self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None
+        self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None,
+        json_mode: bool = False, system_prompt: str | None = None,
     ) -> tuple[str, TokenUsage]:
         """Like call() but also returns TokenUsage."""
         provider = (cfg.provider or "mock").lower()
@@ -51,11 +53,15 @@ class LLMClient:
             usage = TokenUsage(latency_ms=int((time.monotonic() - t0) * 1000))
             return reply, usage
         if provider in {"openai", "openai-compatible"}:
-            return self._openai_compatible_call_with_usage(prompt, cfg, context, provider)
+            return self._openai_compatible_call_with_usage(
+                prompt, cfg, context, provider, json_mode=json_mode, system_prompt=system_prompt
+            )
         if provider == "tongyi":
             tongyi_cfg = ModelConfig(**{**cfg.__dict__})
             tongyi_cfg.base_url = tongyi_cfg.base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
-            return self._openai_compatible_call_with_usage(prompt, tongyi_cfg, context, provider)
+            return self._openai_compatible_call_with_usage(
+                prompt, tongyi_cfg, context, provider, json_mode=json_mode, system_prompt=system_prompt
+            )
         if provider == "wenxin":
             reply = self._wenxin_call(prompt, cfg, context)
             usage = TokenUsage(latency_ms=int((time.monotonic() - t0) * 1000))
@@ -74,14 +80,90 @@ class LLMClient:
             prefix += f"(context={len(context)}) "
         return prefix + prompt
 
+    # ------------------------------------------------------------------
+    # Token counting (best-effort; no hard dependency on tiktoken)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def count_tokens(text: str) -> int:
+        """Estimate token count.  Uses tiktoken when available, else approx."""
+        try:
+            import tiktoken  # type: ignore
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(text))
+        except Exception:
+            # Rough approximation: ~4 chars per token for English/CJK mixed
+            return max(1, len(text) // 4)
+
+    @staticmethod
+    def _trim_context(
+        messages: list[dict[str, Any]],
+        system_tokens: int,
+        prompt_tokens: int,
+        context_window: int,
+        max_tokens: int,
+    ) -> list[dict[str, Any]]:
+        """Remove oldest context messages until the budget fits."""
+        budget = context_window - max_tokens - system_tokens - prompt_tokens - 64  # 64 buffer
+        if budget <= 0:
+            return []
+        trimmed: list[dict[str, Any]] = []
+        used = 0
+        # Walk from newest to oldest
+        for msg in reversed(messages):
+            msg_tokens = LLMClient.count_tokens(msg.get("content", ""))
+            if used + msg_tokens > budget:
+                break
+            trimmed.insert(0, msg)
+            used += msg_tokens
+        return trimmed
+
+    def _build_messages(
+        self,
+        prompt: str,
+        cfg: ModelConfig,
+        context: list[dict[str, Any]] | None,
+        system_prompt: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build the final messages list with dynamic token budget trimming."""
+        sys_text = (system_prompt or "").strip() or "You are a helpful local agent."
+        system_msg = {"role": "system", "content": sys_text}
+        user_msg = {"role": "user", "content": prompt}
+
+        sys_tokens = self.count_tokens(sys_text)
+        prompt_tokens = self.count_tokens(prompt)
+
+        raw_context: list[dict[str, Any]] = []
+        if context:
+            raw_context = [
+                {"role": m["role"], "content": m.get("content", "")}
+                for m in context
+                if m.get("role") in {"user", "assistant", "system"}
+                and m.get("content")
+            ]
+
+        trimmed = self._trim_context(
+            raw_context,
+            system_tokens=sys_tokens,
+            prompt_tokens=prompt_tokens,
+            context_window=cfg.context_window,
+            max_tokens=cfg.max_tokens,
+        )
+        return [system_msg, *trimmed, user_msg]
+
     def _openai_compatible_call(
-        self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None, provider: str = "openai"
+        self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None,
+        provider: str = "openai", system_prompt: str | None = None,
     ) -> str:
-        reply, _ = self._openai_compatible_call_with_usage(prompt, cfg, context, provider)
+        reply, _ = self._openai_compatible_call_with_usage(
+            prompt, cfg, context, provider, system_prompt=system_prompt
+        )
         return reply
 
     def _openai_compatible_call_with_usage(
-        self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None, provider: str = "openai"
+        self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None,
+        provider: str = "openai", json_mode: bool = False,
+        system_prompt: str | None = None,
     ) -> tuple[str, TokenUsage]:
         if not cfg.api_key:
             raise LLMProviderError(
@@ -104,20 +186,24 @@ class LLMClient:
                     status_code=400,
                 )
 
-        messages = [{"role": "system", "content": "You are a helpful local agent."}]
-        if context:
-            for item in context[-8:]:
-                messages.append({"role": item["role"], "content": item["content"]})
-        messages.append({"role": "user", "content": prompt})
+        messages = self._build_messages(prompt, cfg, context, system_prompt)
+
+        # Dynamic max_tokens: ensure we don't exceed context_window
+        prompt_token_est = sum(self.count_tokens(m.get("content", "")) for m in messages)
+        safe_max = max(64, cfg.context_window - prompt_token_est - 32)
+        effective_max_tokens = min(cfg.max_tokens, safe_max)
 
         url = f"{base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {cfg.api_key}"}
-        payload = {
+        payload: dict[str, Any] = {
             "model": cfg.model,
             "messages": messages,
             "temperature": cfg.temperature,
-            "max_tokens": cfg.max_tokens,
+            "max_tokens": effective_max_tokens,
         }
+        # JSON mode for providers that support response_format
+        if json_mode and provider in {"openai", "openai-compatible", "tongyi"}:
+            payload["response_format"] = {"type": "json_object"}
 
         try:
             t0 = time.monotonic()

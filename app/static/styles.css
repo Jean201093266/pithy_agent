@@ -1034,3 +1034,49 @@ kbd {
   animation: msgIn .18s ease;
 }
 
+/* ── Message action bar ───────────────────────────────────────────────── */
+.msg-action-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity .15s;
+  margin: 2px 0 0 44px;
+  height: 22px;
+}
+.msg-row:hover .msg-action-bar,
+.msg-row:focus-within .msg-action-bar {
+  opacity: 1;
+}
+.msg-row.user .msg-action-bar {
+  margin-left: 0;
+  justify-content: flex-end;
+}
+.msg-action-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-sm);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--text-4);
+  transition: background .12s, color .12s;
+  font-size: 11px;
+  padding: 0;
+}
+.msg-action-btn:hover {
+  background: var(--surface-3);
+  color: var(--text-2);
+}
+
+/* ── System prompt textarea ──────────────────────────────────────────── */
+#pref-system-prompt {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  resize: vertical;
+  min-height: 80px;
+}

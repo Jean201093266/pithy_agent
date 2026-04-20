@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -34,6 +36,24 @@ _CMD_BLACKLIST = [
     "net user", "net localgroup",
     "chmod 777 /", "chown root",
     "> /dev/", "> /proc/",
+    # Additional patterns to prevent bypass
+    "curl ", "wget ",  # prevent data exfiltration
+    "base64 -d", "base64 --decode",  # prevent encoded command execution
+    "eval ", "exec(",  # prevent eval-based bypass
+    "python -c", "python3 -c", "perl -e", "ruby -e",  # prevent inline code
+    "nc ", "ncat ", "netcat ",  # prevent reverse shells
+    "powershell -enc", "powershell -e ",  # prevent encoded PS
+    "/etc/passwd", "/etc/shadow",  # prevent credential access
+]
+
+# Additional regex patterns for shell injection
+_CMD_INJECTION_PATTERNS = [
+    r"\$\(.*\)",      # $(command) substitution
+    r"`[^`]+`",        # backtick substitution
+    r"\|\s*sh\b",      # pipe to shell
+    r"\|\s*bash\b",    # pipe to bash
+    r";\s*rm\b",       # semicolon chained rm
+    r"&&\s*rm\b",      # && chained rm
 ]
 
 
@@ -50,13 +70,21 @@ def _is_safe_write_path(path: Path) -> bool:
 
 
 def _check_command_safety(cmd: str) -> None:
-    """Raise PermissionError if the command matches the blacklist."""
+    """Raise PermissionError if the command matches the blacklist or injection patterns."""
+    import re as _re
     lower_cmd = cmd.lower()
     for pattern in _CMD_BLACKLIST:
         if pattern in lower_cmd:
             raise PermissionError(
                 f"Command blocked by security policy (matched pattern: '{pattern}'). "
                 "Use a more specific command or adjust the allowed command list."
+            )
+    # Check shell injection patterns
+    for regex_pat in _CMD_INJECTION_PATTERNS:
+        if _re.search(regex_pat, cmd, _re.IGNORECASE):
+            raise PermissionError(
+                f"Command blocked: potential shell injection detected. "
+                "Avoid command substitution, piping to shells, or chaining destructive commands."
             )
 
 
@@ -95,7 +123,22 @@ def tool_read_file(params: dict[str, Any]) -> dict[str, Any]:
     path = Path(params.get("path", "")).expanduser()
     if not path.exists():
         raise FileNotFoundError(f"文件不存在: {path}")
-    return {"path": str(path), "content": path.read_text(encoding="utf-8")[:5000]}
+    # Guard: check file size
+    file_size = path.stat().st_size
+    if file_size > 10 * 1024 * 1024:  # 10MB
+        raise ValueError(f"文件过大 ({file_size / 1024 / 1024:.1f} MB)，最大支持 10MB")
+    # Guard: detect binary files
+    try:
+        raw = path.read_bytes(1024) if file_size > 0 else b""
+        if b"\x00" in raw[:1024]:
+            raise ValueError(f"文件 {path.name} 似乎是二进制文件，不支持读取")
+    except ValueError:
+        raise
+    except Exception:
+        pass
+    content = path.read_text(encoding="utf-8", errors="replace")[:5000]
+    truncated = file_size > 5000
+    return {"path": str(path), "content": content, "size": file_size, "truncated": truncated}
 
 
 def tool_echo(params: dict[str, Any]) -> dict[str, Any]:
@@ -209,11 +252,36 @@ def tool_sqlite_query(params: dict[str, Any]) -> dict[str, Any]:
     return {"db_path": str(db_path), "query": query, "count": len(data), "columns": columns, "rows": data}
 
 
+def _validate_url_ssrf(url: str) -> None:
+    """Validate URL to prevent SSRF attacks. Blocks private/internal IPs."""
+    import socket
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("Invalid URL: missing hostname")
+    # Block common internal hostnames
+    blocked_hosts = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "metadata.google.internal"}
+    if hostname.lower() in blocked_hosts:
+        raise PermissionError(f"SSRF blocked: access to {hostname} is not allowed")
+    # Resolve and check IP ranges
+    try:
+        resolved = socket.getaddrinfo(hostname, None)
+        for _, _, _, _, sockaddr in resolved:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                raise PermissionError(
+                    f"SSRF blocked: {hostname} resolves to private/reserved IP {ip}"
+                )
+    except (socket.gaierror, OSError):
+        pass  # Allow if DNS resolution fails (let requests handle it)
+
+
 def tool_http_request(params: dict[str, Any]) -> dict[str, Any]:
     """Make an HTTP request to any URL. Supports GET/POST/PUT/DELETE."""
     url = str(params.get("url", "")).strip()
     if not url:
         raise ValueError("url is required")
+    _validate_url_ssrf(url)
     method = str(params.get("method", "GET")).upper()
     if method not in {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"}:
         raise ValueError(f"unsupported HTTP method: {method}")

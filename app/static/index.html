@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" />
-  <link rel="stylesheet" href="/static/styles.css?v=20260417j" />
+  <link rel="stylesheet" href="/static/styles.css?v=20260420a" />
 </head>
 <body data-theme="system">
 
@@ -76,6 +76,10 @@
           <h2 id="chat-title">对话</h2>
         </div>
         <span id="current-session-label" class="session-tag hidden"></span>
+        <button id="export-session-btn" class="btn btn-ghost btn-sm" title="导出对话" style="margin-left:auto">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          导出
+        </button>
       </div>
 
       <div id="chat-log" class="chat-log">
@@ -190,6 +194,12 @@
           </div>
           <button id="save-settings" class="btn btn-primary">保存设置</button>
           <div class="divider"></div>
+          <div class="form-item">
+            <label class="label">Agent 系统提示词（System Prompt）</label>
+            <textarea id="pref-system-prompt" rows="4" placeholder="You are a helpful local agent..."></textarea>
+          </div>
+          <button id="save-system-prompt" class="btn btn-ghost btn-sm">保存提示词</button>
+          <div class="divider"></div>
           <div class="row-between">
             <span class="section-label">发布信息</span>
             <button id="refresh-release-info" class="btn btn-ghost btn-sm">刷新</button>
@@ -235,7 +245,11 @@
             </div>
             <div class="form-item">
               <label class="label">Max Tokens</label>
-              <input id="cfg-max-tokens" type="number" placeholder="512" />
+              <input id="cfg-max-tokens" type="number" placeholder="2048" />
+            </div>
+            <div class="form-item">
+              <label class="label">Context Window</label>
+              <input id="cfg-context-window" type="number" placeholder="8192" />
             </div>
           </div>
           <div class="btn-row">
@@ -443,7 +457,7 @@
 <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github-dark.min.css">
 <script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/common.min.js"></script>
-<script src="/static/app.js?v=20260417j"></script>
+<script src="/static/app.js?v=20260420a"></script>
 </body>
 </html>
 

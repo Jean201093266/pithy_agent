@@ -18,7 +18,7 @@ class LangChainAdapter:
     """Bridges existing local components into LangChain primitives."""
 
     def __init__(self, llm_client: LLMClient, tool_registry: ToolRegistry) -> None:
-        self.llm_client = llm_client
+        self.llm_client = llm_client  # direct access for Planner/Executor
         self.tool_registry = tool_registry
 
     @property

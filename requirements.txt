@@ -16,6 +16,6 @@ pytesseract==0.3.13
 langchain==0.3.12
 langchain-core==0.3.25
 langgraph==0.2.60
-
-
+sentence-transformers>=2.2.2
+slowapi>=0.1.9
 python-multipart>=0.0.9

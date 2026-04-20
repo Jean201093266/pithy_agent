@@ -532,12 +532,24 @@ class EnhancedMemoryManager:
         self.db.touch_memory_items(context_data.get("source_memory_ids", []))
 
         return {
-            "short_term": recent_messages,
+            "short_term": {"messages": recent_messages, "summary": conversation_summary, "state": self.db.get_conversation_state(session_id=session_id)},
             "long_term": deduplicated[:k],
             "memory_prompt": memory_prompt,
             "context_blocks": context_data.get("context_blocks", []),
             "token_estimate": context_data.get("total_token_estimate", 0),
+            "context_messages": self._compose_context_messages(recent_messages, conversation_summary, deduplicated[:k]),
         }
+
+    def _compose_context_messages(self, messages: list[dict[str, Any]], summary: str, long_term: list[dict[str, Any]]) -> list[dict[str, str]]:
+        """Build context messages list compatible with MemoryManager interface."""
+        context: list[dict[str, str]] = []
+        if summary:
+            context.append({"role": "system", "content": f"Session summary: {summary}"})
+        if long_term:
+            bullet_points = "\n".join(f"- ({item['memory_type']}) {item['text']}" for item in long_term)
+            context.append({"role": "system", "content": f"Retrieved long-term memories:\n{bullet_points}"})
+        context.extend({"role": m["role"], "content": m["content"]} for m in messages if "role" in m and "content" in m)
+        return context
 
     def update_after_turn(
         self,

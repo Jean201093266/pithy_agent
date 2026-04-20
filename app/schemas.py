@@ -12,8 +12,9 @@ class ModelConfigIn(BaseModel):
     secret_key: str = Field(default="")
     base_url: str = Field(default="")
     temperature: float = Field(default=0.5, ge=0.0, le=2.0)
-    max_tokens: int = Field(default=512, ge=1, le=4096)
+    max_tokens: int = Field(default=2048, ge=1, le=32768)
     timeout_seconds: int = Field(default=30, ge=5, le=120)
+    context_window: int = Field(default=8192, ge=512, le=200000)
 
 
 class ModelConfigOut(BaseModel):
@@ -23,6 +24,7 @@ class ModelConfigOut(BaseModel):
     temperature: float
     max_tokens: int
     timeout_seconds: int
+    context_window: int = 8192
     has_api_key: bool
     has_secret_key: bool
 
@@ -34,6 +36,7 @@ class AppSettingsIn(BaseModel):
     log_level: str = Field(default="INFO")
     auto_refresh_logs: bool = False
     send_shortcut: str = Field(default="Ctrl+Enter")
+    system_prompt: str = Field(default="", max_length=4000)
 
 
 class AppSettingsOut(AppSettingsIn):
