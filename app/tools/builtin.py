@@ -22,79 +22,85 @@ except Exception:  # pragma: no cover
     pytesseract = None
 
 # ---------------------------------------------------------------------------
-# Security: allowed base directories for file operations
+# Security: command safety checks
 # ---------------------------------------------------------------------------
 _ROOT = Path(__file__).resolve().parents[2]
-_ALLOWED_WRITE_ROOTS: list[Path] = [_ROOT / "data"]
+_HOME = Path.home()
 
-# Dangerous command patterns (case-insensitive substring match)
+# Commands that are BLOCKED entirely (catastrophic / irreversible system-level)
 _CMD_BLACKLIST = [
-    "rm -rf", "del /f", "del /s", "format ", "mkfs",
+    "rm -rf /", "del /f /s /q c:\\", "format c:", "mkfs",
     "shutdown", "reboot", "halt", "poweroff",
     ":(){ :|:& };:", "dd if=",
     "reg delete", "reg add",
     "net user", "net localgroup",
     "chmod 777 /", "chown root",
     "> /dev/", "> /proc/",
-    # Additional patterns to prevent bypass
-    "curl ", "wget ",  # prevent data exfiltration
-    "base64 -d", "base64 --decode",  # prevent encoded command execution
-    "eval ", "exec(",  # prevent eval-based bypass
-    "python -c", "python3 -c", "perl -e", "ruby -e",  # prevent inline code
-    "nc ", "ncat ", "netcat ",  # prevent reverse shells
-    "powershell -enc", "powershell -e ",  # prevent encoded PS
-    "/etc/passwd", "/etc/shadow",  # prevent credential access
+    "nc -l", "ncat -l", "netcat -l",         # listening reverse shells
+    "powershell -enc", "powershell -e ",      # encoded PS execution
+    "/etc/shadow",                            # credential access
 ]
 
-# Additional regex patterns for shell injection
+# Commands that REQUIRE user confirmation (destructive but legitimate)
+_CMD_CONFIRM_PATTERNS = [
+    "rm ",  "rm\t", "rmdir ",                 # Unix delete
+    "del ", "del\t", "rd ", "rd\t",           # Windows delete
+    "remove-item", "ri ",                     # PowerShell delete
+    "shutil.rmtree",                          # Python delete
+    "drop table", "drop database", "truncate",  # SQL destructive
+    "git clean", "git reset --hard",          # Git destructive
+]
+
+# Regex patterns that are always blocked
 _CMD_INJECTION_PATTERNS = [
-    r"\$\(.*\)",      # $(command) substitution
-    r"`[^`]+`",        # backtick substitution
     r"\|\s*sh\b",      # pipe to shell
     r"\|\s*bash\b",    # pipe to bash
-    r";\s*rm\b",       # semicolon chained rm
-    r"&&\s*rm\b",      # && chained rm
+    r";\s*rm\s+-rf\s+/",  # chained recursive root delete
 ]
 
 
-def _is_safe_write_path(path: Path) -> bool:
-    """Return True only if the path is under an allowed write root."""
-    resolved = path.resolve()
-    for root in _ALLOWED_WRITE_ROOTS:
-        try:
-            resolved.relative_to(root.resolve())
-            return True
-        except ValueError:
-            continue
-    return False
+class CommandNeedsConfirmation(Exception):
+    """Raised when a command requires user confirmation before execution."""
+    def __init__(self, command: str, reason: str):
+        self.command = command
+        self.reason = reason
+        super().__init__(f"命令需要用户确认: {reason}")
 
 
-def _check_command_safety(cmd: str) -> None:
-    """Raise PermissionError if the command matches the blacklist or injection patterns."""
+def _check_command_safety(cmd: str, confirmed: bool = False) -> None:
+    """Raise PermissionError if blocked, CommandNeedsConfirmation if needs user OK."""
     import re as _re
-    # Normalize: strip quotes, collapse whitespace to defeat bypass via cu""rl / cu''rl
     normalized = cmd.replace('"', '').replace("'", '').replace('`', '').replace('^', '')
     normalized = _re.sub(r'\s+', ' ', normalized)
     lower_cmd = normalized.lower()
+
+    # Hard-blocked commands
     for pattern in _CMD_BLACKLIST:
         if pattern in lower_cmd:
             raise PermissionError(
-                f"Command blocked by security policy (matched pattern: '{pattern}'). "
-                "Use a more specific command or adjust the allowed command list."
+                f"Command blocked by security policy (matched: '{pattern}'). "
+                "This operation is too dangerous to execute."
             )
-    # Check shell injection patterns (on original cmd)
+    # Injection patterns
     for regex_pat in _CMD_INJECTION_PATTERNS:
         if _re.search(regex_pat, cmd, _re.IGNORECASE):
             raise PermissionError(
-                f"Command blocked: potential shell injection detected. "
-                "Avoid command substitution, piping to shells, or chaining destructive commands."
+                "Command blocked: potential shell injection detected."
             )
-    # Block path traversal attempts
+    # Block path traversal to system-critical directories
     if '../' in cmd or '..\\' in cmd:
-        raise PermissionError(
-            "Command blocked: path traversal detected. "
-            "Use absolute paths instead of relative path traversal."
-        )
+        if any(c in lower_cmd for c in ['/etc/', 'c:\\windows', 'system32']):
+            raise PermissionError(
+                "Command blocked: path traversal to system directory detected."
+            )
+    # Commands requiring user confirmation
+    if not confirmed:
+        for pattern in _CMD_CONFIRM_PATTERNS:
+            if pattern in lower_cmd:
+                raise CommandNeedsConfirmation(
+                    cmd,
+                    f"检测到删除/破坏性操作 ('{pattern.strip()}')，请确认是否执行"
+                )
 
 
 def check_ocr_availability() -> dict[str, Any]:
@@ -157,11 +163,18 @@ def tool_echo(params: dict[str, Any]) -> dict[str, Any]:
 
 def tool_write_file(params: dict[str, Any]) -> dict[str, Any]:
     path = Path(params.get("path", "")).expanduser()
-    if not _is_safe_write_path(path):
-        allowed = ", ".join(str(r) for r in _ALLOWED_WRITE_ROOTS)
-        raise PermissionError(
-            f"写入路径不在允许范围内: {path}\n允许的目录: {allowed}"
-        )
+    resolved = path.resolve()
+    # Block writing to system-critical directories
+    _blocked_prefixes = [
+        Path("C:/Windows"), Path("/etc"), Path("/usr"), Path("/bin"), Path("/sbin"),
+        _HOME / ".ssh", _HOME / ".gnupg",
+    ]
+    for bp in _blocked_prefixes:
+        try:
+            resolved.relative_to(bp.resolve())
+            raise PermissionError(f"写入路径被保护: {resolved}")
+        except ValueError:
+            pass
     content = str(params.get("content", ""))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -195,10 +208,13 @@ def tool_run_command(params: dict[str, Any]) -> dict[str, Any]:
     cmd = str(params.get("command", "")).strip()
     if not cmd:
         raise ValueError("command is required")
-    _check_command_safety(cmd)
-    # Restrict working directory to data/ by default for safety
-    cwd = str(params.get("cwd", _ROOT / "data"))
-    timeout = min(int(params.get("timeout", 20)), 60)
+    confirmed = str(params.get("confirmed", "")).lower() in ("true", "1", "yes")
+    _check_command_safety(cmd, confirmed=confirmed)
+    # Default cwd to user home; allow caller override
+    cwd = str(params.get("cwd", str(Path.home())))
+    if not Path(cwd).is_dir():
+        cwd = str(Path.home())
+    timeout = min(int(params.get("timeout", 30)), 120)
     import shlex
     import platform
     # On Windows, use shell=True as shlex.split doesn't handle Windows paths well

@@ -8,6 +8,7 @@ from typing import Any
 from app.core.db import AppDB
 from app.tools.base import MCPServerConfig, MCPToolResult, ToolManifest, ToolSpec
 from app.tools.builtin import (
+    CommandNeedsConfirmation,
     tool_echo,
     tool_capture_screenshot,
     tool_http_request,
@@ -76,10 +77,13 @@ _BUILTIN_SPECS: list[tuple[str, str, str, Any, dict[str, Any]]] = [
     ),
     (
         "run_command",
-        "Execute a local shell command (high risk – requires authorization)",
+        "Execute a local shell command (high risk – destructive commands require confirmation)",
         "high",
         tool_run_command,
-        _schema("command", command=_str_prop("Shell command to execute")),
+        _schema("command",
+                command=_str_prop("Shell command to execute"),
+                cwd=_str_prop("Working directory (default: user home)"),
+                confirmed=_str_prop("Set to 'true' to confirm destructive commands like rm/del")),
     ),
     (
         "echo",
@@ -368,7 +372,7 @@ class ToolRegistry:
                     return future.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
                 raise TimeoutError(f"工具 {name} 执行超时 ({timeout}s)")
-            except (PermissionError, KeyError):
+            except (PermissionError, KeyError, CommandNeedsConfirmation):
                 raise  # Non-retryable
             except (ConnectionError, TimeoutError, OSError) as exc:
                 last_exc = exc

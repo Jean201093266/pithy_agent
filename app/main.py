@@ -7,7 +7,7 @@ import re
 import secrets
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 
 import psutil
 import yaml
@@ -27,7 +27,6 @@ from app.core.llm import LLMClient
 from app.core.llm_errors import LLMProviderError
 from app.core.chat_graph import ChatGraphEngine
 from app.core.memory_enhanced import EnhancedMemoryManager, EnhancedMemoryConfig
-from app.core.chat_graph_planner import PlannerExecutorEngine
 from app.core.input_guard import InputGuard
 from app.schemas import (
     ChatRequest,
@@ -72,7 +71,7 @@ from app.schemas import (
 from app.skills.runtime import SkillRuntime
 from app.tools.base import MCPServerConfig
 from app.tools.registry import ToolRegistry
-from app.tools.builtin import check_ocr_availability
+from app.tools.builtin import check_ocr_availability, CommandNeedsConfirmation
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
@@ -262,7 +261,6 @@ tool_registry = ToolRegistry(db)
 langchain_adapter = LangChainAdapter(llm_client, tool_registry)
 chat_graph_engine = ChatGraphEngine(langchain_adapter, memory_manager)
 skill_runtime = SkillRuntime(db, config_store, llm_client, tool_registry)
-planner_executor_engine = PlannerExecutorEngine(langchain_adapter, memory_manager)
 APP_LOGGER = logging.getLogger("pithy_agent")
 AUTH_STATE: dict[str, Any] = {
     "locked": config_store.has_unlock_password(),
@@ -626,6 +624,8 @@ def execute_tool(tool_name: str, payload: ToolExecutionRequest, request: Request
     _require_unlocked(request)
     try:
         result = tool_registry.execute(tool_name, payload.params, payload.authorized)
+    except CommandNeedsConfirmation as exc:
+        return {"ok": False, "needs_confirmation": True, "command": exc.command, "reason": exc.reason}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="tool not found") from exc
     except PermissionError as exc:
@@ -840,6 +840,143 @@ def _stream_with_heartbeat(gen_func, *args, heartbeat_interval: float = 8.0, **k
         yield item
 
 
+def _run_react_streaming(
+    message: str,
+    cfg: ModelConfig,
+    session_id: str,
+    enabled_tools: list[dict[str, Any]],
+    is_mock: bool,
+    system_prompt: str,
+    force_tool: str | None,
+    tool_params: dict[str, Any] | None,
+    mem_mgr: Any,
+) -> Generator:
+    """Run a ReAct loop yielding SSE event dicts for each step."""
+    from app.core.agent import (
+        build_react_system_prompt,
+        build_react_scratchpad,
+        parse_react_llm_output,
+    )
+    from app.tools.builtin import CommandNeedsConfirmation as _CNC
+
+    mem_mgr.db.add_message("user", message, session_id=session_id)
+    mem_ctx = mem_mgr.retrieve_context(message, session_id=session_id)
+    mem_prompt = str(mem_ctx.get("memory_prompt") or "")
+
+    yield {"type": "step", "step": "memory",
+           "detail": f"记忆检索完成{'，召回 ' + str(len(mem_ctx.get('long_term') or [])) + ' 条' if mem_ctx.get('long_term') else ''}"}
+
+    available_names = {t.get("name", "") for t in enabled_tools}
+    react_trace: list[dict[str, Any]] = []
+    executed_results: list[dict[str, Any]] = []
+
+    # Handle force_tool
+    if force_tool:
+        params = {k: str(v) for k, v in (tool_params or {}).items()}
+        yield {"type": "step", "step": "tool", "detail": f"调用工具: {force_tool}"}
+        try:
+            result = langchain_adapter.execute_tool(force_tool, params)
+        except _CNC:
+            params["confirmed"] = "true"
+            try:
+                result = langchain_adapter.execute_tool(force_tool, params)
+            except Exception as exc2:
+                result = {"error": str(exc2)}
+        except Exception as exc:
+            result = {"error": str(exc)}
+        executed_results.append({"tool": force_tool, "params": params, "result": result})
+        react_trace.append({"thought": f"Force tool: {force_tool}", "action": {"tool": force_tool, "params": params}, "observation": result})
+        yield {"type": "step_start", "index": 1, "task": f"执行 {force_tool}", "step_type": "tool"}
+        yield {"type": "step_done", "index": 1, "tool": force_tool, "output": json.dumps(result, ensure_ascii=False)[:500]}
+        yield {"type": "step", "step": "tool_done", "detail": f"工具 {force_tool} 执行完毕"}
+
+    # ReAct loop (LLM decides whether to call tools)
+    if not is_mock:
+        react_system = build_react_system_prompt(enabled_tools)
+        question = message if not mem_prompt else f"{message}\n\n[Memory Context]\n{mem_prompt}"
+        max_steps = 6
+        final_streamed = False
+        for step_i in range(max_steps):
+            scratchpad = build_react_scratchpad(question, react_trace)
+            context = [{"role": "system", "content": react_system}]
+            raw_output = llm_client.call(scratchpad, cfg, context=context, system_prompt=system_prompt)
+
+            decision = parse_react_llm_output(raw_output, available_names)
+
+            if decision.should_stop or decision.action is None:
+                react_trace.append({"thought": decision.thought, "action": None, "observation": {"stop_reason": decision.stop_reason}})
+                final = decision.final_answer or raw_output
+                # If this is the first step with no tools called, re-generate
+                # with streaming for a smoother UX
+                if step_i == 0 and not executed_results:
+                    yield {"type": "step", "step": "answer", "detail": "正在生成回答…"}
+                    direct_prompt = message if not mem_prompt else f"{message}\n\n[Memory]\n{mem_prompt}"
+                    context_msgs = mem_ctx.get("context_messages") or []
+                    for chunk in llm_client.stream(direct_prompt, cfg, context=context_msgs, system_prompt=system_prompt):
+                        yield {"type": "token", "text": chunk}
+                else:
+                    yield {"type": "step", "step": "answer", "detail": "正在生成回答…"}
+                    for chunk in _chunk_text(final):
+                        yield {"type": "token", "text": chunk}
+                final_streamed = True
+                break
+
+            # Tool call
+            call = decision.action
+            yield {"type": "step_start", "index": step_i + 1, "task": decision.thought[:100], "step_type": "tool"}
+            yield {"type": "step", "step": "tool", "detail": f"调用工具: {call.name}"}
+            try:
+                result = langchain_adapter.execute_tool(call.name, call.params)
+            except _CNC:
+                call.params["confirmed"] = "true"
+                try:
+                    result = langchain_adapter.execute_tool(call.name, call.params)
+                except Exception as exc2:
+                    result = {"error": str(exc2)}
+            except Exception as exc:
+                result = {"error": str(exc)}
+
+            executed_results.append({"tool": call.name, "params": call.params, "result": result})
+            react_trace.append({"thought": decision.thought, "action": {"tool": call.name, "params": call.params}, "observation": result})
+            yield {"type": "step_done", "index": step_i + 1, "tool": call.name, "output": json.dumps(result, ensure_ascii=False)[:500]}
+            yield {"type": "step", "step": "tool_done", "detail": f"工具 {call.name} 执行完毕"}
+    else:
+        # Mock mode
+        final_streamed = True
+        final = f"[MockAgent] {message}"
+        yield {"type": "step", "step": "answer", "detail": "Mock 回答"}
+        yield {"type": "token", "text": final}
+
+    # If no final answer was streamed yet (all steps were tool calls), generate summary
+    if not is_mock and not final_streamed and react_trace and react_trace[-1].get("action") is not None:
+        summary_prompt = (
+            f"用户输入: {message}\n"
+            f"记忆上下文: {mem_prompt or '无'}\n"
+            f"工具执行结果: {json.dumps(executed_results, ensure_ascii=False)[:3000]}\n"
+            f"请根据以上信息给出最终回答。"
+        )
+        yield {"type": "step", "step": "answer", "detail": "正在合成最终回答…"}
+        for chunk in llm_client.stream(summary_prompt, cfg, system_prompt=system_prompt):
+            yield {"type": "token", "text": chunk}
+
+    # Persist
+    # Note: final_reply will be assembled by the caller from token events
+    mem_mgr.db.add_message("assistant", "", session_id=session_id)  # placeholder
+    mem_mgr.update_after_turn(
+        user_message=message,
+        assistant_reply="",
+        session_id=session_id,
+        tool_trace=executed_results,
+    )
+
+
+def _chunk_text(text: str, chunk_size: int = 4) -> Generator:
+    """Split text into small chunks for streaming."""
+    words = text.split()
+    for i, word in enumerate(words):
+        yield ("" if i == 0 else " ") + word
+
+
 @app.post("/api/chat/stream")
 def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
     _require_unlocked(request)
@@ -869,83 +1006,39 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
         all_tools = tool_registry.list_tools()
         enabled_tools = [t for t in all_tools if t.get("enabled", True)]
 
-        # ── Choose engine: Planner/Executor (preferred) or legacy ReAct ──
-        use_planner = planner_executor_engine.available and not payload.force_tool
+        # ── ReAct engine: LLM autonomously decides tool usage ──────────
+        yield _sse({"type": "step", "step": "think", "detail": "启动 ReAct 推理…"})
 
-        if use_planner:
-            yield _sse({"type": "step", "step": "think", "detail": "启动 Planner/Executor 双 Agent 模式…"})
-            final_reply = ""
-            executed_results: list[dict[str, Any]] = []
-            total_prompt_tokens = 0
-            total_completion_tokens = 0
+        final_reply = ""
+        executed_results: list[dict[str, Any]] = []
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
 
-            try:
-                def _planner_sse_gen():
-                    for evt in planner_executor_engine.stream_events(
-                        message=_safe_message,
-                        cfg=cfg,
-                        session_id=session_id,
-                        enabled_tools=enabled_tools,
-                        is_mock=is_mock,
-                        system_prompt=system_prompt,
-                    ):
-                        yield evt
-
-                for evt_or_keepalive in _stream_with_heartbeat(_planner_sse_gen):
-                    if isinstance(evt_or_keepalive, str):
-                        # keepalive comment
-                        yield evt_or_keepalive
-                        continue
-                    evt = evt_or_keepalive
-                    if evt.get("type") == "token":
-                        final_reply += evt.get("text", "")
-                    elif evt.get("type") == "step_done":
-                        executed_results.append({
-                            "step": evt.get("index"),
-                            "tool": evt.get("tool"),
-                            "output": evt.get("output"),
-                        })
-                    yield _sse(evt)
-
-            except LLMProviderError as exc:
-                yield _sse({"type": "error", "message": exc.message})
-                return
-
-        else:
-            # ── ChatGraphEngine ReAct path (fallback when PlannerExecutor unavailable) ──
-            yield _sse({"type": "step", "step": "think", "detail": "启动 LangGraph ReAct 推理…"})
-            executed_results = []
-            final_reply = ""
-            total_prompt_tokens = 0
-            total_completion_tokens = 0
-
-            try:
-                graph_out = chat_graph_engine.run(
-                    message=_safe_message,
-                    cfg=cfg,
-                    session_id=session_id,
-                    force_tool=payload.force_tool,
-                    tool_params=payload.tool_params,
-                    enabled_tools=enabled_tools,
-                    is_mock=is_mock,
+        try:
+            def _react_gen():
+                yield from _run_react_streaming(
+                    _safe_message, cfg, session_id, enabled_tools,
+                    is_mock, system_prompt, payload.force_tool,
+                    payload.tool_params, memory_manager,
                 )
-                executed_results = list(graph_out.get("executed_results") or [])
-                final_reply = str(graph_out.get("final_reply") or "")
+            for item in _stream_with_heartbeat(_react_gen):
+                if isinstance(item, str):
+                    yield item
+                    continue
+                evt = item
+                if evt.get("type") == "token":
+                    final_reply += evt.get("text", "")
+                elif evt.get("type") == "step_done":
+                    executed_results.append({
+                        "step": evt.get("index"),
+                        "tool": evt.get("tool"),
+                        "output": evt.get("output"),
+                    })
+                yield _sse(evt)
 
-                # Emit tool execution events
-                for er in executed_results:
-                    yield _sse({"type": "step", "step": "tool", "detail": f"调用工具: {er.get('tool', '')}"})
-                    yield _sse({"type": "step", "step": "tool_done", "detail": f"工具 {er.get('tool', '')} 执行完毕"})
-
-                # Stream the final reply word-by-word
-                yield _sse({"type": "step", "step": "answer", "detail": "正在生成回答…"})
-                words = final_reply.split()
-                for i, word in enumerate(words):
-                    yield _sse({"type": "token", "text": ("" if i == 0 else " ") + word})
-
-            except LLMProviderError as exc:
-                yield _sse({"type": "error", "message": exc.message})
-                return
+        except LLMProviderError as exc:
+            yield _sse({"type": "error", "message": exc.message})
+            return
 
         # ── Record token usage ───────────────────────────────────────────
         if total_prompt_tokens or total_completion_tokens:

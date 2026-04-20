@@ -84,6 +84,89 @@ class ReActDecision:
 
 
 # ---------------------------------------------------------------------------
+# Task complexity classifier
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+# Patterns that suggest multi-step planning is needed (use word boundaries or longer phrases)
+_MULTI_STEP_PATTERNS_ZH = [
+    r"先[^生].*(?:然后|再|接着|之后)",   # "先...然后/再/接着" (exclude 先生)
+    r"第[一二三四1234]步",              # "第一步"
+    r"步骤\s*[：:]",                    # "步骤："
+    r"首先.*(?:其次|然后|最后)",          # "首先...然后..."
+    r"接着.*(?:最后|然后)",              # "接着...最后"
+]
+_MULTI_STEP_PATTERNS_EN = [
+    r"\bfirst\b.*\bthen\b",
+    r"\bstep\s*[12345]\b",
+    r"\bfirst\b.*\bafter\s+that\b",
+    r"\bthen\b.*\bfinally\b",
+    r"\bfollowed\s+by\b",
+]
+
+# Tool references – use word boundaries to avoid false positives
+_TOOL_HINT_PATTERNS = [
+    r"文件",       # file
+    r"搜索",       # search
+    r"命令",       # command
+    r"运行",       # run/execute
+    r"截图",       # screenshot
+    r"\bocr\b",
+    r"数据库",     # database
+    r"\bhttp\b",
+    r"\bapi\b",
+    r"写入",       # write
+    r"读取",       # read
+    r"查询",       # query
+    r"创建.*文件",  # create file
+    r"打开.*文件",  # open file
+    r"删除.*文件",  # delete file
+    r"在桌面",     # on desktop
+    r"执行",       # execute
+]
+
+
+def classify_task_complexity(message: str) -> str:
+    """
+    Classify task complexity to choose execution strategy.
+    
+    Returns:
+        'simple'  - Direct LLM call, no tools needed (e.g. "你好", "解释什么是AI")
+        'react'   - May need 1 tool call, ReAct handles it (e.g. "读取文件 x.txt")
+        'plan'    - Multi-step, needs planner (e.g. "搜索X，写入文件Y，然后总结")
+    """
+    lower = message.lower().strip()
+    
+    # Very short messages are almost always simple chat
+    if len(message) < 8:
+        return "simple"
+    
+    # Check multi-step patterns (regex-based, more precise)
+    is_multi_step = any(
+        _re.search(pat, lower, _re.IGNORECASE)
+        for pat in _MULTI_STEP_PATTERNS_ZH + _MULTI_STEP_PATTERNS_EN
+    )
+
+    # Count tool hints (precise patterns)
+    tool_hint_count = sum(
+        1 for pat in _TOOL_HINT_PATTERNS
+        if _re.search(pat, lower, _re.IGNORECASE)
+    )
+
+    # Multi-step with tool hints → plan
+    if is_multi_step and tool_hint_count >= 1:
+        return "plan"
+    
+    # Has tool hints but not multi-step → ReAct
+    if tool_hint_count >= 1:
+        return "react"
+    
+    # Default: simple LLM call
+    return "simple"
+
+
+# ---------------------------------------------------------------------------
 # LLM-driven ReAct helpers
 # ---------------------------------------------------------------------------
 
@@ -255,7 +338,7 @@ def build_plan(text: str) -> AgentBrainResult:
     wants_read = "读取" in text or "read file" in lower or "打开文件" in text
     wants_write = "写入" in text or "保存" in text or "write file" in lower or "save to" in lower
     wants_json = "json" in lower and ("解析" in text or "parse" in lower)
-    wants_command = "命令" in text or "command" in lower or "运行程序" in text or "run command" in lower
+    wants_command = "命令" in text or "command" in lower or "运行程序" in lower or "run command" in lower
 
     tool_calls: list[AgentToolCall] = []
     plan: list[str] = []
