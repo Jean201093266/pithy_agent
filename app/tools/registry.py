@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -351,12 +352,22 @@ class ToolRegistry:
         return str(exc)
 
     def execute(self, name: str, params: dict[str, Any], authorized: bool = False,
-                _retry: int = 2) -> Any:
-        """Execute a tool with optional retry for transient errors."""
+                _retry: int = 2, timeout: int = 60) -> Any:
+        """Execute a tool with optional retry for transient errors.
+
+        Args:
+            timeout: Maximum execution time in seconds (default 60).
+        """
+        import concurrent.futures
         last_exc: Exception | None = None
         for attempt in range(max(1, _retry)):
             try:
-                return self._execute_once(name, params, authorized)
+                # Run with timeout to prevent hung tools
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(self._execute_once, name, params, authorized)
+                    return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(f"工具 {name} 执行超时 ({timeout}s)")
             except (PermissionError, KeyError):
                 raise  # Non-retryable
             except (ConnectionError, TimeoutError, OSError) as exc:
@@ -376,9 +387,19 @@ class ToolRegistry:
             server_id, _ = self._mcp_tools[name]
             client = self._mcp_clients.get(server_id)
             if client is None:
-                raise RuntimeError(f"MCP server not connected: {server_id}")
+                # Auto-reconnect: try to restore the connection
+                row = self.db.get_mcp_server(server_id)
+                if row:
+                    try:
+                        cfg = MCPServerConfig(**row["config"])
+                        self._connect_mcp_server(cfg)
+                        client = self._mcp_clients.get(server_id)
+                    except Exception as exc:
+                        LOGGER.warning("MCP auto-reconnect failed for %s: %s", server_id, exc)
+                if client is None:
+                    raise RuntimeError(f"MCP server not connected: {server_id}")
             result: MCPToolResult = client.call_tool(name, params)
-            return result.to_dict()
+            return self._cap_result_size(result.to_dict())
 
         # Builtin or manifest tool
         spec = self._builtin_tools.get(name)
@@ -398,4 +419,13 @@ class ToolRegistry:
             raise PermissionError(f"high-risk tool requires authorization: {name}")
         raw = spec.handler(params)
         # Wrap in MCPToolResult for uniform output
-        return MCPToolResult.from_dict(raw).to_dict()
+        return self._cap_result_size(MCPToolResult.from_dict(raw).to_dict())
+
+    @staticmethod
+    def _cap_result_size(result: Any, max_chars: int = 50_000) -> Any:
+        """Truncate oversized tool results to prevent memory bloat."""
+        if isinstance(result, dict):
+            serialized = json.dumps(result, ensure_ascii=False)
+            if len(serialized) > max_chars:
+                return {"_truncated": True, "data": serialized[:max_chars], "original_size": len(serialized)}
+        return result

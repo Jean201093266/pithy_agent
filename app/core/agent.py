@@ -179,9 +179,16 @@ def parse_react_llm_output(text: str, available_tools: set[str] | None = None) -
                 # Treat as plain string input
                 params = {"input": raw_input}
 
-        # Validate tool name (optional guard)
+        # Validate tool name – reject unknown tools to prevent hallucinated calls
         if available_tools and tool_name not in available_tools:
-            LOGGER.warning("ReAct parser: LLM requested unknown tool '%s'", tool_name)
+            LOGGER.warning("ReAct parser: LLM requested unknown tool '%s', treating as final answer", tool_name)
+            return ReActDecision(
+                thought=thought,
+                action=None,
+                should_stop=True,
+                stop_reason="unknown_tool",
+                final_answer=text,
+            )
 
         return ReActDecision(
             thought=thought,

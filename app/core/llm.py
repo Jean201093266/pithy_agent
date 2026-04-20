@@ -35,6 +35,9 @@ class TokenUsage:
 
 
 class LLMClient:
+    def __init__(self) -> None:
+        self._wenxin_token_cache: dict[str, tuple[str, float]] = {}  # key -> (token, expiry)
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=5), reraise=True)
     def call(self, prompt: str, cfg: ModelConfig, context: list[dict[str, Any]] | None = None,
              system_prompt: str | None = None) -> str:
@@ -268,27 +271,36 @@ class LLMClient:
                 messages.insert(0, {"role": item["role"], "content": item["content"]})
 
         try:
-            token_resp = requests.post(
-                token_url,
-                params={
-                    "grant_type": "client_credentials",
-                    "client_id": cfg.api_key,
-                    "client_secret": cfg.secret_key,
-                },
-                timeout=cfg.timeout_seconds,
-            )
-            if token_resp.status_code >= 400:
-                self._raise_provider_http_error("wenxin", token_resp)
-            token_data = token_resp.json()
-            access_token = token_data.get("access_token")
-            if not access_token:
-                raise LLMProviderError(
-                    code="LLM_AUTH_ERROR",
-                    message="failed to fetch wenxin access token",
-                    provider="wenxin",
-                    retryable=False,
-                    status_code=401,
+            # Cache wenxin access tokens (typically valid for 30 days)
+            cache_key = f"{cfg.api_key}:{cfg.secret_key}"
+            cached = self._wenxin_token_cache.get(cache_key)
+            if cached and cached[1] > time.time():
+                access_token = cached[0]
+            else:
+                token_resp = requests.post(
+                    token_url,
+                    params={
+                        "grant_type": "client_credentials",
+                        "client_id": cfg.api_key,
+                        "client_secret": cfg.secret_key,
+                    },
+                    timeout=cfg.timeout_seconds,
                 )
+                if token_resp.status_code >= 400:
+                    self._raise_provider_http_error("wenxin", token_resp)
+                token_data = token_resp.json()
+                access_token = token_data.get("access_token")
+                if not access_token:
+                    raise LLMProviderError(
+                        code="LLM_AUTH_ERROR",
+                        message="failed to fetch wenxin access token",
+                        provider="wenxin",
+                        retryable=False,
+                        status_code=401,
+                    )
+                # Cache for 23 hours (tokens typically last 30 days, but be conservative)
+                expires_in = int(token_data.get("expires_in", 86400))
+                self._wenxin_token_cache[cache_key] = (access_token, time.time() + min(expires_in - 3600, 82800))
 
             chat_resp = requests.post(
                 chat_url,
@@ -472,19 +484,16 @@ class LLMClient:
         """Generate a text embedding vector.
 
         Priority:
-        1. sentence-transformers (local, no API cost)
+        1. sentence-transformers (local, no API cost) — via shared embeddings module
         2. OpenAI-compatible /embeddings API
-        3. Fallback: hash-based pseudo-embedding (original behaviour, dims=64)
+        3. Fallback: hash-based pseudo-embedding (via shared embeddings module)
         """
-        # --- Try sentence-transformers (local) ---
+        from app.core.embeddings import embed_text
+
+        # --- Try sentence-transformers (local) via shared module ---
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
-            _model = getattr(self, "_st_model", None)
-            if _model is None:
-                self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
-                _model = self._st_model
-            vec = _model.encode(text, normalize_embeddings=True)
-            return vec.tolist()
+            return embed_text(text)  # uses cached model internally
         except ImportError:
             pass
         except Exception as exc:
@@ -510,18 +519,4 @@ class LLMClient:
                 LOGGER.warning("API embed failed: %s", exc)
 
         # --- Fallback: hash-based pseudo-embedding ---
-        import math as _math
-        import re as _re
-        dims = 64
-        tokens = _re.findall(r"[\w\u4e00-\u9fff]+", text.lower())
-        vec = [0.0] * dims
-        if tokens:
-            for token in tokens:
-                h = hash(token)
-                idx = h % dims
-                sign = 1.0 if (h >> 1) & 1 else -1.0
-                vec[idx] += sign
-            norm = _math.sqrt(sum(v * v for v in vec))
-            if norm > 0:
-                vec = [v / norm for v in vec]
-        return vec
+        return embed_text(text, dims=64)

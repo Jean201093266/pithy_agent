@@ -109,6 +109,9 @@ class EnhancedMemoryConfig:
     short_term_budget: int = 2000       # 短期记忆 token 预算
     long_term_budget: int = 3000        # 长期记忆 token 预算
 
+    # Conversation window
+    max_messages_per_session: int = 200  # 超过此数自动归档旧消息
+
 
 class MemoryDeduplicator:
     """Handles deduplication of similar memories."""
@@ -604,6 +607,9 @@ class EnhancedMemoryManager:
         # Refresh summary if needed
         self._refresh_summary_if_needed(session_id)
 
+        # Archive old messages to prevent unbounded conversation growth
+        self._archive_old_messages(session_id)
+
         # Generate reflection if needed
         reflection_memory = None
         if self.reflector.should_reflect(session_id):
@@ -782,9 +788,9 @@ class EnhancedMemoryManager:
         ranked = self.ranker.rank(items, query_embedding)
 
         keep_ids = {int(item["id"]) for item, _ in ranked[:self.config.long_term_cap]}
-        for item in items:
-            if int(item["id"]) not in keep_ids:
-                self.db.delete_memory_item(int(item["id"]))
+        delete_ids = [int(item["id"]) for item in items if int(item["id"]) not in keep_ids]
+        if delete_ids:
+            self.db.delete_memory_items_batch(delete_ids)
 
         LOGGER.info(f"Pruned memory: {len(items)} -> {self.config.long_term_cap} items")
 
@@ -793,6 +799,7 @@ class EnhancedMemoryManager:
         items = self.db.list_memory_items(session_id=session_id, limit=2000)
 
         now = datetime.now()
+        delete_ids: list[int] = []
         for item in items:
             importance = float(item.get("importance", 0.5))
 
@@ -805,9 +812,34 @@ class EnhancedMemoryManager:
 
                     # Aggressive cleanup for old, low-importance items
                     if age_days > 30 and importance < self.config.importance_threshold:
-                        self.db.delete_memory_item(item["id"])
+                        delete_ids.append(item["id"])
                 except (ValueError, TypeError):
                     pass
+
+        if delete_ids:
+            self.db.delete_memory_items_batch(delete_ids)
+
+    def _archive_old_messages(self, session_id: str) -> None:
+        """Archive old messages when conversation exceeds max_messages_per_session."""
+        max_msgs = self.config.max_messages_per_session
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM conversations WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            count = int(row["cnt"]) if row else 0
+        if count <= max_msgs:
+            return
+        # Delete oldest messages beyond the window, keeping the most recent max_msgs
+        overflow = count - max_msgs
+        with self.db.connect() as conn:
+            conn.execute(
+                "DELETE FROM conversations WHERE id IN ("
+                "  SELECT id FROM conversations WHERE session_id = ? ORDER BY id ASC LIMIT ?"
+                ")",
+                (session_id, overflow),
+            )
+        LOGGER.info("Archived %d old messages for session %s (total was %d)", overflow, session_id, count)
 
     @staticmethod
     def _embed_text(text: str, dims: int = 64) -> list[float]:

@@ -11,6 +11,8 @@ from app.core.embeddings import cosine_similarity
 
 
 class AppDB:
+    _SCHEMA_VERSION = 2  # Increment when schema changes
+
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -18,8 +20,15 @@ class AppDB:
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
-        """Return a thread-local persistent connection."""
+        """Return a thread-local persistent connection with health check."""
         conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            # Verify connection is still alive
+            try:
+                conn.execute("SELECT 1")
+            except sqlite3.Error:
+                conn = None
+                self._local.conn = None
         if conn is None:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
@@ -137,6 +146,12 @@ class AppDB:
                 conn.execute("ALTER TABLE skills ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
             if "description" not in skill_cols:
                 conn.execute("ALTER TABLE skills ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+            # Track schema version for future migrations
+            conn.execute(
+                "INSERT INTO kv_store(key, value) VALUES('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(self._SCHEMA_VERSION),),
+            )
 
     def get_kv(self, key: str) -> str | None:
         with self.connect() as conn:
@@ -270,6 +285,17 @@ class AppDB:
     def delete_memory_item(self, memory_id: int) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM memory_items WHERE id = ?", (memory_id,))
+
+    def delete_memory_items_batch(self, memory_ids: list[int]) -> int:
+        """Delete multiple memory items in a single transaction. Returns count deleted."""
+        if not memory_ids:
+            return 0
+        with self.connect() as conn:
+            conn.executemany(
+                "DELETE FROM memory_items WHERE id = ?",
+                [(mid,) for mid in memory_ids],
+            )
+        return len(memory_ids)
 
     def find_similar_memories(
         self,
@@ -613,6 +639,14 @@ class AppDB:
                 (sid, name or sid),
             )
 
+    def session_exists(self, session_id: str) -> bool:
+        """Check if a session exists without loading all sessions."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM chat_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return row is not None
+
     def list_sessions(self) -> list[dict[str, Any]]:
         """Return all sessions with message count, ordered by most-recently updated."""
         with self.connect() as conn:
@@ -666,6 +700,7 @@ class AppDB:
             conn.execute("DELETE FROM conversation_summaries WHERE session_id=?", (session_id,))
             conn.execute("DELETE FROM conversation_state WHERE session_id=?", (session_id,))
             conn.execute("DELETE FROM memory_items WHERE session_id=?", (session_id,))
+            conn.execute("DELETE FROM token_usage WHERE session_id=?", (session_id,))
             cur = conn.execute("DELETE FROM chat_sessions WHERE session_id=?", (session_id,))
         return cur.rowcount > 0
 

@@ -106,7 +106,39 @@ _log_handler = logging.FileHandler(LOG_DIR / "agent.log", encoding="utf-8")
 _log_handler.setFormatter(_JSONFormatter())
 logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 
-app = FastAPI(title="Pithy Local Agent", version="0.1.0")
+# ---------------------------------------------------------------------------
+# Application lifespan: startup checks + graceful shutdown
+# ---------------------------------------------------------------------------
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _lifespan(application: FastAPI):
+    """Run startup checks and clean up on shutdown."""
+    _startup_logger = logging.getLogger("pithy_agent.lifecycle")
+    _startup_logger.info("Starting Pithy Local Agent v%s", application.version)
+    # Validate data directory
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    # Validate DB schema on startup
+    try:
+        with db.connect() as conn:
+            conn.execute("SELECT 1 FROM chat_sessions LIMIT 1")
+        _startup_logger.info("Database schema validated")
+    except Exception as exc:
+        _startup_logger.error("Database validation failed: %s", exc)
+    yield
+    # Graceful shutdown
+    _startup_logger.info("Shutting down – closing MCP connections")
+    for sid in list(tool_registry._mcp_clients):
+        try:
+            tool_registry._disconnect_mcp_server(sid)
+        except Exception:
+            pass
+    _startup_logger.info("Shutdown complete")
+
+
+app = FastAPI(title="Pithy Local Agent", version="0.1.0", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -140,6 +172,21 @@ try:
         return _JSONResponse(status_code=429, content={"detail": "请求过于频繁，请稍后再试。"})
 except ImportError:
     limiter = None
+
+# ---------------------------------------------------------------------------
+# Global exception handler (return JSON, not HTML 500)
+# ---------------------------------------------------------------------------
+from starlette.responses import JSONResponse as _JSONResp
+
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    APP_LOGGER = logging.getLogger("pithy_agent")
+    APP_LOGGER.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return _JSONResp(
+        status_code=500,
+        content={"detail": "服务器内部错误，请查看日志或稍后重试。", "type": type(exc).__name__},
+    )
 
 # ---------------------------------------------------------------------------
 # Security headers middleware (pure ASGI to avoid SSE buffering issues)
@@ -182,7 +229,32 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_headers)
 
 
+class RequestTraceMiddleware:
+    """Inject a unique X-Trace-Id header into every response for observability."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        trace_id = secrets.token_hex(8)
+        scope.setdefault("state", {})["trace_id"] = trace_id
+
+        async def send_with_trace(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.append((b"x-trace-id", trace_id.encode()))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_trace)
+
+
 app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestTraceMiddleware)
 
 app.mount("/static", StaticFiles(directory=ROOT / "app" / "static"), name="static")
 
@@ -220,12 +292,11 @@ def _ensure_session(session_id: str | None) -> str:
         sid = f"session_{int(_time.time() * 1000)}_{_secrets.token_hex(4)}"
         db.create_session(sid, "新会话")
     else:
+        # Validate session_id format (alphanumeric, underscore, dash, max 120 chars)
+        if len(sid) > 120 or not re.match(r'^[a-zA-Z0-9_\-]+$', sid):
+            raise HTTPException(status_code=400, detail="invalid session_id format")
         # Use direct query instead of listing all sessions
-        with db.connect() as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM chat_sessions WHERE session_id = ?", (sid,)
-            ).fetchone()
-        if not exists:
+        if not db.session_exists(sid):
             db.create_session(sid, sid)
     return sid
 
@@ -1503,10 +1574,17 @@ def logs(
     log_file = LOG_DIR / "agent.log"
     if not log_file.exists():
         return LogsResponse(lines=[])
-    lines = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+    # Read only the tail of the file to avoid loading huge log files
+    from collections import deque
+    max_scan = limit * 5  # scan extra lines to account for filtering
+    tail: deque[str] = deque(maxlen=max_scan)
+    with open(log_file, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            tail.append(line.rstrip("\n"))
+    lines = list(tail)
     if level:
         level_upper = level.upper()
-        lines = [line for line in lines if f" {level_upper} " in line]
+        lines = [line for line in lines if level_upper in line]
     if search:
         needle = search.lower()
         lines = [line for line in lines if needle in line.lower()]
