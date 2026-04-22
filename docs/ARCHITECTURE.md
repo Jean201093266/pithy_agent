@@ -71,9 +71,8 @@
 
 ### 2.1 模块初始化顺序
 
-```python
-# app/main.py 顶层执行（模块加载时）
-
+```
+app/main.py 顶层执行（模块加载时）:
 1. 日志系统初始化
    └─ JSON 格式日志 → logs/agent.log
    └─ _JSONFormatter: {ts, level, logger, msg, trace_id, exception}
@@ -81,7 +80,7 @@
 2. FastAPI 应用创建（含 lifespan）
    └─ lifespan 上下文管理器:
        ├─ 启动: 验证 data/ 目录、DB schema、日志启动信息
-       └─ 关闭: 断开所有 MCP 连接、日志关闭信息
+       └─ 关闭: 断开所有MCP连接、日志关闭信息
 
 3. 中间件注册（执行顺序: 从外到内）
    ├─ CORSMiddleware        — 跨域处理
@@ -186,7 +185,7 @@ _ensure_session(session_id) → 会话管理
 
 ### 4.1 引擎选择逻辑
 
-```python
+```
 # 流式端点 (/api/chat/stream):
 if planner_executor_engine.available and not force_tool:
     → PlannerExecutorEngine (双 Agent, 流式)
